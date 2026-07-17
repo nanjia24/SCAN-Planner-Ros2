@@ -162,11 +162,6 @@ namespace scan_planner
   void PlanningVisualization::displayGlobalPathList(vector<Eigen::Vector3d> init_pts, const double scale, int id)
   {
 
-    if (global_list_pub->get_subscription_count() == 0)
-    {
-      return;
-    }
-
     Eigen::Vector4d color(0, 0.5, 0.5, 1);
     displayMarkerList(global_list_pub, init_pts, scale, color, id);
   }
@@ -174,22 +169,12 @@ namespace scan_planner
   void PlanningVisualization::displayInitPathList(vector<Eigen::Vector3d> init_pts, const double scale, int id)
   {
 
-    if (init_list_pub->get_subscription_count() == 0)
-    {
-      return;
-    }
-
     Eigen::Vector4d color(0, 0, 1, 1);
     displayMarkerList(init_list_pub, init_pts, scale, color, id);
   }
 
   void PlanningVisualization::displayOptimalList(Eigen::MatrixXd optimal_pts, int id)
   {
-
-    if (optimal_list_pub->get_subscription_count() == 0)
-    {
-      return;
-    }
 
     vector<Eigen::Vector3d> list;
     for (int i = 0; i < optimal_pts.cols(); i++)
@@ -203,11 +188,6 @@ namespace scan_planner
 
   void PlanningVisualization::displayOptimalTraj(UniformBspline position_traj, int id)
   {
-    if (optimal_list_pub->get_subscription_count() == 0)
-    {
-      return;
-    }
-
     const double duration = position_traj.getTimeSum();
     if (duration < 1e-6)
     {
@@ -274,11 +254,6 @@ namespace scan_planner
 
   void PlanningVisualization::displayAStarList(std::vector<std::vector<Eigen::Vector3d>> a_star_paths, int id /* = Eigen::Vector4d(0.5,0.5,0,1)*/)
   {
-
-    if (a_star_list_pub->get_subscription_count() == 0)
-    {
-      return;
-    }
 
     int i = 0;
     vector<Eigen::Vector3d> list;
