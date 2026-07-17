@@ -10,6 +10,10 @@ namespace scan_planner
   PlanningVisualization::PlanningVisualization(rclcpp::Node *node)
   {
     node_ = node;
+    if (!node_->has_parameter("visualization.frame_id"))
+      node_->declare_parameter<std::string>("visualization.frame_id", "world");
+    frame_id_ = node_->get_parameter("visualization.frame_id").as_string();
+
     const auto marker_qos = rclcpp::QoS(20).reliable().transient_local();
     goal_point_pub = node_->create_publisher<visualization_msgs::msg::Marker>("goal_point", marker_qos);
     global_list_pub = node_->create_publisher<visualization_msgs::msg::Marker>("global_list", marker_qos);
@@ -23,7 +27,7 @@ namespace scan_planner
                                                 Eigen::Vector4d color, int id)
   {
     visualization_msgs::msg::Marker sphere, line_strip;
-    sphere.header.frame_id = line_strip.header.frame_id = "world";
+    sphere.header.frame_id = line_strip.header.frame_id = frame_id_;
     sphere.header.stamp = line_strip.header.stamp = node_->now();
     sphere.type = visualization_msgs::msg::Marker::SPHERE_LIST;
     line_strip.type = visualization_msgs::msg::Marker::LINE_STRIP;
@@ -58,7 +62,7 @@ namespace scan_planner
                                                        const vector<Eigen::Vector3d> &list, double scale, Eigen::Vector4d color, int id)
   {
     visualization_msgs::msg::Marker sphere, line_strip;
-    sphere.header.frame_id = line_strip.header.frame_id = "map";
+    sphere.header.frame_id = line_strip.header.frame_id = frame_id_;
     sphere.header.stamp = line_strip.header.stamp = node_->now();
     sphere.type = visualization_msgs::msg::Marker::SPHERE_LIST;
     line_strip.type = visualization_msgs::msg::Marker::LINE_STRIP;
@@ -93,7 +97,7 @@ namespace scan_planner
                                                         const vector<Eigen::Vector3d> &list, double scale, Eigen::Vector4d color, int id)
   {
     visualization_msgs::msg::Marker arrow;
-    arrow.header.frame_id = "map";
+    arrow.header.frame_id = frame_id_;
     arrow.header.stamp = node_->now();
     arrow.type = visualization_msgs::msg::Marker::ARROW;
     arrow.action = visualization_msgs::msg::Marker::ADD;
@@ -134,7 +138,7 @@ namespace scan_planner
   void PlanningVisualization::displayGoalPoint(Eigen::Vector3d goal_point, Eigen::Vector4d color, const double scale, int id)
   {
     visualization_msgs::msg::Marker sphere;
-    sphere.header.frame_id = "world";
+    sphere.header.frame_id = frame_id_;
     sphere.header.stamp = node_->now();
     sphere.type = visualization_msgs::msg::Marker::SPHERE;
     sphere.action = visualization_msgs::msg::Marker::ADD;
@@ -233,7 +237,7 @@ namespace scan_planner
     }
 
     visualization_msgs::msg::Marker sphere, line_strip;
-    sphere.header.frame_id = line_strip.header.frame_id = "world";
+    sphere.header.frame_id = line_strip.header.frame_id = frame_id_;
     sphere.header.stamp = line_strip.header.stamp = node_->now();
     sphere.type = visualization_msgs::msg::Marker::SPHERE_LIST;
     line_strip.type = visualization_msgs::msg::Marker::LINE_STRIP;

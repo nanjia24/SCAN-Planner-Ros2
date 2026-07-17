@@ -8,6 +8,7 @@
 #include <iostream>
 #include <traj_utils/polynomial_traj.h>
 #include <rclcpp/rclcpp.hpp>
+#include <string>
 #include <vector>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -22,6 +23,7 @@ namespace scan_planner
     using MarkerPublisher = rclcpp::Publisher<visualization_msgs::msg::Marker>;
     using MarkerArrayPublisher = rclcpp::Publisher<visualization_msgs::msg::MarkerArray>;
     rclcpp::Node *node_{nullptr};
+    std::string frame_id_{"world"};
 
     MarkerPublisher::SharedPtr goal_point_pub;
     MarkerPublisher::SharedPtr global_list_pub;
