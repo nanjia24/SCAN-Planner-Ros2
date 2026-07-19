@@ -3,6 +3,8 @@
 #include <limits>
 #include <string>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <chrono>
+#include <sstream>
 
 namespace
 {
@@ -64,6 +66,20 @@ void GridMap::initMap(rclcpp::Node *node)
   load_parameter(node_, "grid_map.sensor_type", mp_.sensor_type_, string("lidar"));
   load_parameter(node_, "grid_map.cloud_is_world", mp_.cloud_is_world_, true);
   load_parameter(node_, "grid_map.need_extrinsic", mp_.need_extrinsic_, true);
+  load_parameter(node_, "grid_map.eviction_export_enabled", mp_.eviction_export_enabled_, false);
+  load_parameter(node_, "grid_map.eviction_topic", mp_.eviction_topic_,
+                std::string("/scan/grid_map/evicted_voxels"));
+  load_parameter(node_, "grid_map.eviction_session_id", mp_.eviction_session_id_, std::string());
+
+  if (mp_.eviction_session_id_.empty())
+  {
+    std::ostringstream session;
+    session << node_->get_name() << "-"
+            << std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+                   .count();
+    mp_.eviction_session_id_ = session.str();
+  }
 
   mp_.lidar_extrinsic_ <<
       1.0, 0.0, 0.0, -0.01100,
@@ -172,6 +188,14 @@ void GridMap::initMap(rclcpp::Node *node)
   unknown_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/unknown", rclcpp::SensorDataQoS());
   depth_cloud_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/depth_cloud", rclcpp::SensorDataQoS());
   extrinsic_pose_pub_ = node_->create_publisher<nav_msgs::msg::Odometry>("grid_map/sensor_pose_extrinsic", 10);
+  if (mp_.eviction_export_enabled_)
+  {
+    eviction_pub_ = node_->create_publisher<amphibious_mapping_msgs::msg::GridMapEviction>(
+        mp_.eviction_topic_, rclcpp::QoS(10).reliable());
+    RCLCPP_INFO(node_->get_logger(),
+                "[GridMap] eviction export enabled: topic=%s session=%s",
+                mp_.eviction_topic_.c_str(), mp_.eviction_session_id_.c_str());
+  }
 
   md_.occ_need_update_ = false;
   md_.use_cloud_update_ = false;
@@ -334,6 +358,14 @@ void GridMap::updateSlidingMap(const Eigen::Vector3d& center)
 
   if ((shift_num.cwiseAbs().array() >= mp_.map_voxel_num_.array()).any())
   {
+    if (mp_.eviction_export_enabled_)
+    {
+      std::vector<int> all_addresses;
+      all_addresses.reserve(md_.occupancy_buffer_.size());
+      for (int addr = 0; addr < static_cast<int>(md_.occupancy_buffer_.size()); ++addr)
+        all_addresses.push_back(addr);
+      publishEvictedVoxels(all_addresses);
+    }
     resetAllMapData();
     mp_.map_origin_idx_ = new_origin_idx;
     updateMapBoundaryFromIndex();
@@ -403,6 +435,8 @@ void GridMap::updateSlidingMap(const Eigen::Vector3d& center)
   for (int addr : clear_addrs)
     resetCellByAddressForSliding(addr, clear_mask);
 
+  publishEvictedVoxels(clear_addrs);
+
   for (int addr : clear_addrs)
   {
     md_.occupancy_buffer_[addr] = mp_.clamp_min_log_ - mp_.unknown_flag_;
@@ -418,6 +452,41 @@ void GridMap::updateSlidingMap(const Eigen::Vector3d& center)
   updateMapBoundaryFromIndex();
   boundIndex(md_.local_bound_min_);
   boundIndex(md_.local_bound_max_);
+}
+
+void GridMap::publishEvictedVoxels(const std::vector<int>& addresses)
+{
+  if (!mp_.eviction_export_enabled_ || !eviction_pub_ || addresses.empty())
+    return;
+
+  amphibious_mapping_msgs::msg::GridMapEviction message;
+  message.header.stamp = node_->get_clock()->now();
+  message.header.frame_id = mp_.frame_id_;
+  message.source_session_id = mp_.eviction_session_id_;
+  message.sequence = ++eviction_sequence_;
+  message.source_resolution = static_cast<float>(mp_.resolution_);
+  message.voxels.reserve(addresses.size());
+
+  for (const int addr : addresses)
+  {
+    if (addr < 0 || addr >= static_cast<int>(md_.occupancy_buffer_.size()))
+      continue;
+
+    const double log_odds = md_.occupancy_buffer_[addr];
+    if (log_odds < mp_.clamp_min_log_ - 1e-3)
+      continue;
+
+    Eigen::Vector3i id;
+    hashIdToGlobalIndex(addr, id);
+    auto &voxel = message.voxels.emplace_back();
+    voxel.x = id(0);
+    voxel.y = id(1);
+    voxel.z = id(2);
+    voxel.log_odds = static_cast<float>(log_odds);
+  }
+
+  if (!message.voxels.empty())
+    eviction_pub_->publish(std::move(message));
 }
 
 void GridMap::resetBuffer()

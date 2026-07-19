@@ -7,6 +7,7 @@ endif()
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 find_package(ament_cmake REQUIRED)
+find_package(amphibious_mapping_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -29,7 +30,7 @@ target_include_directories(plan_env PUBLIC
   ${OpenCV_INCLUDE_DIRS}
 )
 ament_target_dependencies(plan_env
-  cv_bridge geometry_msgs message_filters nav_msgs pcl_conversions rclcpp
+  amphibious_mapping_msgs cv_bridge geometry_msgs message_filters nav_msgs pcl_conversions rclcpp
   sensor_msgs tf2 tf2_ros visualization_msgs
 )
 target_link_libraries(plan_env Eigen3::Eigen ${PCL_LIBRARIES} ${OpenCV_LIBS})
@@ -39,6 +40,6 @@ install(TARGETS plan_env EXPORT export_plan_env
 install(DIRECTORY include/ DESTINATION include)
 ament_export_targets(export_plan_env HAS_LIBRARY_TARGET)
 ament_export_dependencies(
-  cv_bridge Eigen3 geometry_msgs message_filters nav_msgs pcl_conversions
+  amphibious_mapping_msgs cv_bridge Eigen3 geometry_msgs message_filters nav_msgs pcl_conversions
   rclcpp sensor_msgs tf2 tf2_ros visualization_msgs)
 ament_package()

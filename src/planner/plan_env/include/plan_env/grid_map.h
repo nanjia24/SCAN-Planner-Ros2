@@ -30,6 +30,7 @@
 #include <message_filters/time_synchronizer.h>
 
 #include <plan_env/raycast.h>
+#include <amphibious_mapping_msgs/msg/grid_map_eviction.hpp>
 
 #define logit(x) (log((x) / (1 - (x))))
 
@@ -94,6 +95,11 @@ struct MappingParameters {
 
   /* active mapping */
   double unknown_flag_;
+
+  /* persistent global-map export */
+  bool eviction_export_enabled_;
+  string eviction_topic_;
+  string eviction_session_id_;
 };
 
 // intermediate mapping data for fusion
@@ -226,6 +232,7 @@ private:
   int setCacheOccupancy(Eigen::Vector3d pos, int occ);
   Eigen::Vector3d closetPointInMap(const Eigen::Vector3d& pt, const Eigen::Vector3d& ray_pos);
   void updateSlidingMap(const Eigen::Vector3d& center);
+  void publishEvictedVoxels(const std::vector<int>& addresses);
   void updateMapBoundaryFromIndex();
   void resetAllMapData();
   void resetCellByAddress(int addr);
@@ -263,7 +270,9 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr unknown_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr depth_cloud_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr extrinsic_pose_pub_;
+  rclcpp::Publisher<amphibious_mapping_msgs::msg::GridMapEviction>::SharedPtr eviction_pub_;
   rclcpp::TimerBase::SharedPtr occ_timer_, vis_timer_;
+  uint64_t eviction_sequence_{0};
 
   //
   uniform_real_distribution<double> rand_noise_;
