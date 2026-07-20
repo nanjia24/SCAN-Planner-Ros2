@@ -113,6 +113,7 @@ namespace scan_planner
     bool planNextWaypoint();
     bool isWaypointSequenceMode() const;
     bool adjustGlobalTargetIfOccupied();
+    void displayRemainingGlobalPath();
     void getLocalTarget();
     void finishProcess();
     void publishSelfInflationMarker();

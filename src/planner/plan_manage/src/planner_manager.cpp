@@ -53,6 +53,10 @@ namespace scan_planner
       if (!node->has_parameter(name)) node->declare_parameter<double>(name, default_value);
       return node->get_parameter(name).as_double();
     };
+    const auto get_bool = [node](const std::string &name, bool default_value) {
+      if (!node->has_parameter(name)) node->declare_parameter<bool>(name, default_value);
+      return node->get_parameter(name).as_bool();
+    };
     pp_.max_vel_ = get_double("manager.max_vel", -1.0);
     pp_.max_acc_ = get_double("manager.max_acc", -1.0);
     pp_.max_jerk_ = get_double("manager.max_jerk", -1.0);
@@ -61,6 +65,7 @@ namespace scan_planner
     pp_.feasibility_tolerance_ = get_double("manager.feasibility_tolerance", 0.0);
     pp_.ctrl_pt_dist = get_double("manager.control_points_distance", -1.0);
     pp_.planning_horizon_ = get_double("manager.planning_horizon", 5.0);
+    pp_.use_global_reference_init_ = get_bool("manager.use_global_reference_init", false);
 
     local_data_.traj_id_ = 0;
     grid_map_.reset(new GridMap);
@@ -112,7 +117,50 @@ namespace scan_planner
       start_end_derivatives.clear();
       flag_regenerate = false;
 
-      if (flag_first_call || flag_polyInit || flag_force_polynomial /*|| ( start_pt - local_target_pt ).norm() < 1.0*/) // Initial path generated from a min-snap traj by order.
+      bool initialized_from_global_reference = false;
+      const double reference_start_t = std::max(
+          0.0,
+          std::min(global_data_.last_progress_time_, global_data_.global_duration_));
+      if (pp_.use_global_reference_init_ && flag_polyInit && !flag_randomPolyTraj &&
+          global_data_.global_duration_ > 1e-3 &&
+          (start_pt - local_target_pt).norm() >= pp_.ctrl_pt_dist * 6.0)
+      {
+        double reference_duration = 0.0;
+        global_data_.getTrajByRadius(
+            reference_start_t,
+            pp_.planning_horizon_,
+            pp_.ctrl_pt_dist,
+            point_set,
+            start_end_derivatives,
+            ts,
+            reference_duration);
+
+        if (point_set.size() >= 7 && start_end_derivatives.size() == 4 && ts > 1e-4)
+        {
+          point_set.front() = start_pt;
+          point_set.back() = local_target_pt;
+          start_end_derivatives[0] = start_vel;
+          start_end_derivatives[1] = local_target_vel;
+          start_end_derivatives[2] = start_acc;
+          start_end_derivatives[3] = Eigen::Vector3d::Zero();
+          initialized_from_global_reference = true;
+          flag_first_call = false;
+          flag_force_polynomial = false;
+          RCLCPP_INFO(node_->get_logger(),
+                      "Initialized local trajectory from global reference path: %zu points, %.2f s",
+                      point_set.size(), reference_duration);
+        }
+        else
+        {
+          point_set.clear();
+          start_end_derivatives.clear();
+          RCLCPP_WARN(node_->get_logger(),
+                      "Global reference segment is too short; falling back to polynomial initialization");
+        }
+      }
+
+      if (!initialized_from_global_reference &&
+          (flag_first_call || flag_polyInit || flag_force_polynomial /*|| ( start_pt - local_target_pt ).norm() < 1.0*/)) // Initial path generated from a min-snap traj by order.
       {
         flag_first_call = false;
         flag_force_polynomial = false;
@@ -169,7 +217,7 @@ namespace scan_planner
         start_end_derivatives.push_back(gl_traj.evaluateAcc(0));
         start_end_derivatives.push_back(gl_traj.evaluateAcc(t));
       }
-      else // Initial path generated from previous trajectory.
+      else if (!initialized_from_global_reference) // Initial path generated from previous trajectory.
       {
 
         double t;

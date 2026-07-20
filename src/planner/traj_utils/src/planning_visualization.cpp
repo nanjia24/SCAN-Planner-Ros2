@@ -7,6 +7,49 @@ using std::cout;
 using std::endl;
 namespace scan_planner
 {
+  vector<Eigen::Vector3d> PlanningVisualization::resamplePathByArcLength(
+      const vector<Eigen::Vector3d> &points, const double spacing)
+  {
+    if (points.size() <= 1 || spacing <= 1e-6)
+      return points;
+
+    vector<double> cumulative(points.size(), 0.0);
+    for (size_t i = 1; i < points.size(); ++i)
+      cumulative[i] = cumulative[i - 1] + (points[i] - points[i - 1]).norm();
+
+    const double total_length = cumulative.back();
+    if (total_length <= 1e-6)
+      return {points.front()};
+
+    const int interval_count = std::max(
+        1, static_cast<int>(std::floor(total_length / spacing + 0.5)));
+    const double actual_spacing = total_length / interval_count;
+    vector<Eigen::Vector3d> sampled;
+    sampled.reserve(interval_count + 1);
+
+    size_t upper_index = 1;
+    sampled.push_back(points.front());
+    for (int sample_index = 1; sample_index < interval_count; ++sample_index)
+    {
+      const double target = actual_spacing * sample_index;
+      while (upper_index + 1 < cumulative.size() && cumulative[upper_index] < target)
+        ++upper_index;
+
+      const size_t lower_index = upper_index - 1;
+      const double segment_length = cumulative[upper_index] - cumulative[lower_index];
+      if (segment_length <= 1e-9)
+      {
+        sampled.push_back(points[upper_index]);
+        continue;
+      }
+
+      const double ratio = (target - cumulative[lower_index]) / segment_length;
+      sampled.push_back(points[lower_index] + ratio * (points[upper_index] - points[lower_index]));
+    }
+    sampled.push_back(points.back());
+    return sampled;
+  }
+
   PlanningVisualization::PlanningVisualization(rclcpp::Node *node)
   {
     node_ = node;
@@ -159,11 +202,15 @@ namespace scan_planner
     goal_point_pub->publish(sphere);
   }
 
-  void PlanningVisualization::displayGlobalPathList(vector<Eigen::Vector3d> init_pts, const double scale, int id)
+  void PlanningVisualization::displayGlobalPathList(vector<Eigen::Vector3d> global_pts, const double scale, int id)
   {
-
     Eigen::Vector4d color(0, 0.5, 0.5, 1);
-    displayMarkerList(global_list_pub, init_pts, scale, color, id);
+    displayMarkerList(
+        global_list_pub,
+        resamplePathByArcLength(global_pts, 0.4),
+        scale,
+        color,
+        id);
   }
 
   void PlanningVisualization::displayInitPathList(vector<Eigen::Vector3d> init_pts, const double scale, int id)
@@ -250,6 +297,18 @@ namespace scan_planner
 
     optimal_list_pub->publish(sphere);
     optimal_list_pub->publish(line_strip);
+  }
+
+  void PlanningVisualization::clearOptimalTraj(const int id)
+  {
+    visualization_msgs::msg::Marker marker;
+    marker.header.frame_id = frame_id_;
+    marker.header.stamp = node_->now();
+    marker.action = visualization_msgs::msg::Marker::DELETE;
+    marker.id = id;
+    optimal_list_pub->publish(marker);
+    marker.id = id + 1000;
+    optimal_list_pub->publish(marker);
   }
 
   void PlanningVisualization::displayAStarList(std::vector<std::vector<Eigen::Vector3d>> a_star_paths, int id /* = Eigen::Vector4d(0.5,0.5,0,1)*/)

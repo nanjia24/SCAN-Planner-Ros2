@@ -601,7 +601,9 @@ namespace scan_planner
       else
       {
         replan_fail_count_++;
-        changeFSMExecState(REPLAN_TRAJ, "FSM");
+        visualization_->clearOptimalTraj(0);
+        callEmergencyStop(odom_pos_);
+        changeFSMExecState(GEN_NEW_TRAJ, "REPLAN_STOP");
       }
 
       break;
@@ -742,13 +744,25 @@ namespace scan_planner
       start_acc_.setZero();
     }
 
-    if (!planner_manager_->planGlobalTraj(
-            start_pt_,
-            start_vel_,
-            start_acc_,
-            end_pt_,
-            Eigen::Vector3d::Zero(),
-            Eigen::Vector3d::Zero()))
+    if (navi_mode_ == NAVI_MODE::REFERENCE_PATH)
+    {
+      // The reference-path mode owns a multi-waypoint global trajectory. Do
+      // not replace it with a shortcut from the current pose to the final
+      // goal; getLocalTarget() will advance last_progress_time_ on it.
+      if (planner_manager_->global_data_.global_duration_ <= 1e-3)
+      {
+        RCLCPP_ERROR(node_->get_logger(),
+                     "Reference path is unavailable during local replan");
+        return false;
+      }
+    }
+    else if (!planner_manager_->planGlobalTraj(
+                 start_pt_,
+                 start_vel_,
+                 start_acc_,
+                 end_pt_,
+                 Eigen::Vector3d::Zero(),
+                 Eigen::Vector3d::Zero()))
     {
       RCLCPP_ERROR(node_->get_logger(),
                    "[navi_mode=%d] Unable to refresh global trajectory from odom to current target", navi_mode_);
@@ -926,6 +940,27 @@ namespace scan_planner
     return true;
   }
 
+  void SCANReplanFSM::displayRemainingGlobalPath()
+  {
+    auto &global_data = planner_manager_->global_data_;
+    const double duration = global_data.global_duration_;
+    const double start_t = std::max(
+        0.0, std::min(global_data.last_progress_time_, duration));
+
+    std::vector<Eigen::Vector3d> remaining_path;
+    if (duration > 1e-3)
+    {
+      constexpr double sample_dt = 0.1;
+      remaining_path.reserve(
+          static_cast<size_t>(std::ceil((duration - start_t) / sample_dt)) + 1);
+      for (double t = start_t; t < duration; t += sample_dt)
+        remaining_path.push_back(global_data.getPosition(t));
+      remaining_path.push_back(global_data.getPosition(duration));
+    }
+
+    visualization_->displayGlobalPathList(remaining_path, 0.1, 0);
+  }
+
   void SCANReplanFSM::getLocalTarget()
   {
     double t;
@@ -961,10 +996,12 @@ namespace scan_planner
         break;
       }
     }
-    if (t > planner_manager_->global_data_.global_duration_) // Last global point
+    if (t >= planner_manager_->global_data_.global_duration_) // Last global point
     {
       local_target_pt_ = end_pt_;
       target_t = planner_manager_->global_data_.global_duration_;
+      planner_manager_->global_data_.last_progress_time_ = std::max(
+          planner_manager_->global_data_.last_progress_time_, dist_min_t);
     }
 
     auto targetOccupancy = [&](const Eigen::Vector3d &pt) {
@@ -1029,6 +1066,8 @@ namespace scan_planner
       local_target_vel_ = planner_manager_->global_data_.getVelocity(target_t);
       // cout << "AA" << endl;
     }
+
+    displayRemainingGlobalPath();
   }
 
 } // namespace scan_planner
