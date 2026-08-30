@@ -22,5 +22,25 @@ TEST(DynamicFeasibility, DoesNotShortenAnAlreadyFeasibleTrajectory)
   EXPECT_DOUBLE_EQ(requiredTimeScale(0.5, 0.8, 0.7, 1.0), 1.0);
 }
 
+TEST(DynamicFeasibility, RechecksAfterRetimingAnInfeasibleTrajectory)
+{
+  int check_count = 0;
+  int retime_count = 0;
+
+  const bool feasible = retimeUntilFeasible(
+    3,
+    [&check_count](double *, bool) {
+      ++check_count;
+      return check_count >= 2;
+    },
+    [&retime_count](double, int, int) {
+      ++retime_count;
+    });
+
+  EXPECT_TRUE(feasible);
+  EXPECT_EQ(check_count, 2);
+  EXPECT_EQ(retime_count, 1);
+}
+
 }  // namespace
 }  // namespace scan_planner
