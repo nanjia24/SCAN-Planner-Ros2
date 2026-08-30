@@ -1,5 +1,6 @@
 // #include <fstream>
 #include <plan_manage/planner_manager.h>
+#include <plan_manage/dynamic_feasibility.hpp>
 #include <chrono>
 #include <thread>
 
@@ -342,7 +343,25 @@ namespace scan_planner
         pos = UniformBspline(optimal_control_points, 3, ts);
     }
 
-    if (!flag_step_2_success || !checkDynamicFeasibility(pos))
+    bool dynamically_feasible = flag_step_2_success;
+    constexpr int max_retiming_attempts = 3;
+    for (int attempt = 0; dynamically_feasible && attempt <= max_retiming_attempts; ++attempt)
+    {
+      double required_scale = 1.0;
+      dynamically_feasible = checkDynamicFeasibility(
+        pos, &required_scale, attempt == max_retiming_attempts);
+      if (dynamically_feasible || attempt == max_retiming_attempts)
+        break;
+
+      const double applied_scale = std::max(1.02, required_scale * 1.02);
+      RCLCPP_WARN(
+        node_->get_logger(),
+        "Retiming dynamically infeasible trajectory: attempt=%d/%d scale=%.3f",
+        attempt + 1, max_retiming_attempts, applied_scale);
+      pos.lengthenTime(applied_scale);
+    }
+
+    if (!flag_step_2_success || !dynamically_feasible)
     {
       printf("\033[34mThis refined trajectory is unsafe or dynamically infeasible. Skip publishing it.\n\033[0m");
       continuous_failures_count_++;
@@ -387,9 +406,17 @@ namespace scan_planner
     vector<Eigen::Vector3d> points;
     points.push_back(start_pos);
 
+    constexpr double waypoint_merge_tolerance = 1e-3;
     for (size_t wp_i = 0; wp_i < waypoints.size(); wp_i++)
     {
-      points.push_back(waypoints[wp_i]);
+      if ((waypoints[wp_i] - points.back()).norm() > waypoint_merge_tolerance)
+        points.push_back(waypoints[wp_i]);
+    }
+
+    if (points.size() < 2)
+    {
+      RCLCPP_WARN(node_->get_logger(), "Waypoint path contains no motion after duplicate removal");
+      return false;
     }
 
     double total_len = 0;
@@ -553,38 +580,41 @@ namespace scan_planner
     local_data_.traj_id_ += 1;
   }
 
-  bool SCANPlannerManager::checkDynamicFeasibility(UniformBspline position_traj)
+  bool SCANPlannerManager::checkDynamicFeasibility(
+    UniformBspline position_traj, double *required_time_scale, const bool log_failure)
   {
     UniformBspline vel_traj = position_traj.getDerivative();
     UniformBspline acc_traj = vel_traj.getDerivative();
     const double duration = position_traj.getTimeSum();
     const double sample_dt = std::max(0.01, std::min(0.05, duration / 50.0));
-    const double vel_limit = pp_.max_vel_ + pp_.vel_tolerance_;
-    const double acc_limit = pp_.max_acc_ + pp_.acc_tolerance_;
+    const double tolerance_scale = 1.0 + std::max(0.0, pp_.feasibility_tolerance_);
+    const double vel_limit = pp_.max_vel_ * tolerance_scale + 1e-4;
+    const double acc_limit = pp_.max_acc_ * tolerance_scale + 1e-4;
+    double max_velocity = 0.0;
+    double max_acceleration = 0.0;
 
     for (double t = 0.0; t < duration + 1e-6; t += sample_dt)
     {
       const double tc = std::min(t, duration);
-      Eigen::Vector3d vel = vel_traj.evaluateDeBoorT(tc);
-      if (vel.norm() > vel_limit)
-      {
-        RCLCPP_WARN(node_->get_logger(),
-                    "Dynamic feasibility failed: velocity at t=%.3f is %.3f > %.3f",
-                    tc, vel.norm(), vel_limit);
-        return false;
-      }
-
-      Eigen::Vector3d acc = acc_traj.evaluateDeBoorT(tc);
-      if (acc.norm() > acc_limit)
-      {
-        RCLCPP_WARN(node_->get_logger(),
-                    "Dynamic feasibility failed: acceleration at t=%.3f is %.3f > %.3f",
-                    tc, acc.norm(), acc_limit);
-        return false;
-      }
+      max_velocity = std::max(max_velocity, vel_traj.evaluateDeBoorT(tc).norm());
+      max_acceleration = std::max(max_acceleration, acc_traj.evaluateDeBoorT(tc).norm());
     }
 
-    return true;
+    const double scale = requiredTimeScale(
+      max_velocity, max_acceleration, vel_limit, acc_limit);
+    if (required_time_scale != nullptr)
+      *required_time_scale = scale;
+    if (scale <= 1.0)
+      return true;
+
+    if (log_failure)
+    {
+      RCLCPP_WARN(
+        node_->get_logger(),
+        "Dynamic feasibility failed after retiming: velocity %.3f/%.3f, acceleration %.3f/%.3f, required scale %.3f",
+        max_velocity, vel_limit, max_acceleration, acc_limit, scale);
+    }
+    return false;
   }
 
   void SCANPlannerManager::reparamBspline(UniformBspline &bspline, vector<Eigen::Vector3d> &start_end_derivative, double ratio,
