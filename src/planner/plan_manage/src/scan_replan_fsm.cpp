@@ -31,6 +31,9 @@ namespace scan_planner
     need_hover_stop_ = false;
     replan_fail_count_ = 0;
     last_freeze_update_time_ = node_->now();
+    exploration_waypoint_time_ = rclcpp::Time(0, 0, node_->get_clock()->get_clock_type());
+    exploration_reference_path_time_ =
+        rclcpp::Time(0, 0, node_->get_clock()->get_clock_type());
 
     /*  fsm param  */
     navi_mode_ = load_parameter<int>(node_, "fsm.navi_mode", -1);
@@ -38,6 +41,12 @@ namespace scan_planner
     no_replan_thresh_ = load_parameter<double>(node_, "fsm.thresh_no_replan", -1.0);
     planning_horizon_ = load_parameter<double>(node_, "fsm.planning_horizon", -1.0);
     emergency_time_ = load_parameter<double>(node_, "fsm.emergency_time", 1.0);
+    exploration_direction_replan_threshold_ = load_parameter<double>(
+        node_, "fsm.exploration_direction_replan_threshold", 0.5);
+    exploration_waypoint_timeout_ = load_parameter<double>(
+        node_, "fsm.exploration_waypoint_timeout", 3.0);
+    exploration_return_stop_distance_ = load_parameter<double>(
+        node_, "fsm.exploration_return_stop_distance", 0.5);
     enable_fail_safe_ = load_parameter<bool>(node_, "fsm.fail_safe", true);
     max_replan_fail_count_ = load_parameter<int>(node_, "fsm.max_replan_fail_count", 1000);
     self_inflation_z_up_ = load_parameter<double>(node_, "grid_map.obstacles_inflation_z_up", 0.0);
@@ -80,8 +89,13 @@ namespace scan_planner
 
     bspline_pub_ = node_->create_publisher<scan_planner_msgs::msg::Bspline>("planning/bspline", 10);
     data_disp_pub_ = node_->create_publisher<scan_planner_msgs::msg::DataDisp>("planning/data_display", 100);
+    fsm_state_pub_ = node_->create_publisher<std_msgs::msg::String>(
+        "planning/fsm_state", rclcpp::QoS(1).reliable().transient_local());
     self_inflation_pub_ = node_->create_publisher<visualization_msgs::msg::Marker>(
         "self_inflation", rclcpp::QoS(1).reliable().transient_local());
+    std_msgs::msg::String initial_fsm_state;
+    initial_fsm_state.data = "INIT";
+    fsm_state_pub_->publish(initial_fsm_state);
 
     if (navi_mode_ == NAVI_MODE::MANUAL_TARGET)
       goal_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
@@ -92,8 +106,23 @@ namespace scan_planner
           "initial_path", 1, std::bind(&SCANReplanFSM::pathCallback, this, std::placeholders::_1));
     else if (navi_mode_ == NAVI_MODE::PRESET_TARGET)
       RCLCPP_INFO(node_->get_logger(), "Preset waypoint mode will start after the first odometry message");
+    else if (navi_mode_ == NAVI_MODE::EXPLORATION)
+    {
+      exploration_waypoint_sub_ = node_->create_subscription<geometry_msgs::msg::PointStamped>(
+          "way_point", 5,
+          std::bind(&SCANReplanFSM::explorationWaypointCallback, this, std::placeholders::_1));
+      path_sub_ = node_->create_subscription<nav_msgs::msg::Path>(
+          "exploration_reference_path", 1,
+          std::bind(&SCANReplanFSM::explorationReferencePathCallback, this,
+                    std::placeholders::_1));
+      exploration_finish_sub_ = node_->create_subscription<std_msgs::msg::Bool>(
+          "exploration_finish", 5,
+          std::bind(&SCANReplanFSM::explorationFinishCallback, this, std::placeholders::_1));
+      RCLCPP_INFO(node_->get_logger(),
+                  "Exploration waypoint mode is ready; ordered reference path enabled");
+    }
     else
-      throw std::runtime_error("fsm.navi_mode must be 1, 2, or 3");
+      throw std::runtime_error("fsm.navi_mode must be 1, 2, 3, or 4");
   }
 
   void SCANReplanFSM::planGlobalTrajbyGivenWps()
@@ -380,11 +409,316 @@ namespace scan_planner
     }
   }
 
+  bool SCANReplanFSM::isExplorationMode() const
+  {
+    return navi_mode_ == NAVI_MODE::EXPLORATION;
+  }
+
+  bool SCANReplanFSM::explorationWaypointIsFresh() const
+  {
+    return exploration_waypoint_received_ &&
+           isExplorationWaypointFresh(
+               node_->now().seconds(), exploration_waypoint_time_.seconds(),
+               exploration_waypoint_timeout_);
+  }
+
+  bool SCANReplanFSM::explorationReferencePathIsFresh() const
+  {
+    return exploration_reference_path_received_ &&
+           isExplorationWaypointFresh(
+               node_->now().seconds(), exploration_reference_path_time_.seconds(),
+               exploration_waypoint_timeout_);
+  }
+
+  bool SCANReplanFSM::hasActiveLocalTrajectory() const
+  {
+    const LocalTrajData &info = planner_manager_->local_data_;
+    if (info.start_time_.seconds() < 1e-5 || info.duration_ <= 1e-5)
+      return false;
+    const double elapsed = (node_->now() - info.start_time_).seconds();
+    return elapsed >= 0.0 && elapsed < info.duration_ - 0.05;
+  }
+
+  void SCANReplanFSM::explorationWaypointCallback(
+      const geometry_msgs::msg::PointStamped::ConstSharedPtr &msg)
+  {
+    if (!msg || !std::isfinite(msg->point.x) || !std::isfinite(msg->point.y) ||
+        !std::isfinite(msg->point.z))
+    {
+      RCLCPP_WARN(node_->get_logger(), "Ignore invalid exploration waypoint");
+      return;
+    }
+    if (!msg->header.frame_id.empty() && !self_inflation_frame_id_.empty() &&
+        msg->header.frame_id != self_inflation_frame_id_)
+    {
+      RCLCPP_WARN_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 1000,
+          "Ignore exploration waypoint in frame '%s'; expected '%s'",
+          msg->header.frame_id.c_str(), self_inflation_frame_id_.c_str());
+      return;
+    }
+
+    Eigen::Vector3d waypoint(msg->point.x, msg->point.y, msg->point.z);
+    exploration_waypoint_time_ = node_->now();
+    exploration_waypoint_received_ = true;
+    if (have_odom_ && !explorationReferencePathIsFresh())
+    {
+      Eigen::Vector3d candidate_direction = waypoint - odom_pos_;
+      candidate_direction.z() = 0.0;
+      constexpr int kDirectionConfirmations = 2;
+      const Eigen::Vector3d committed_direction =
+          have_target_ ? exploration_direction_ : Eigen::Vector3d::Zero();
+      const ExplorationDirectionDecision decision = considerExplorationDirection(
+          committed_direction, candidate_direction,
+          exploration_direction_replan_threshold_, kDirectionConfirmations,
+          exploration_direction_gate_);
+      if (!decision.accept)
+      {
+        RCLCPP_INFO_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 1000,
+            "Holding exploration direction change (%d/%d confirmations)",
+            exploration_direction_gate_.pending_count, kDirectionConfirmations);
+        return;
+      }
+      if (decision.request_replan)
+        exploration_early_replan_requested_ = true;
+    }
+
+    exploration_waypoint_ = waypoint;
+    if (!exploration_home_reached_ || !exploration_finished_)
+      trigger_ = true;
+  }
+
+  void SCANReplanFSM::explorationReferencePathCallback(
+      const nav_msgs::msg::Path::ConstSharedPtr &msg)
+  {
+    if (!msg || msg->poses.size() < 2)
+    {
+      RCLCPP_WARN_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 1000,
+          "Ignore exploration reference path with fewer than two poses");
+      return;
+    }
+    if (!msg->header.frame_id.empty() && !self_inflation_frame_id_.empty() &&
+        msg->header.frame_id != self_inflation_frame_id_)
+    {
+      RCLCPP_WARN_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 1000,
+          "Ignore exploration reference path in frame '%s'; expected '%s'",
+          msg->header.frame_id.c_str(), self_inflation_frame_id_.c_str());
+      return;
+    }
+
+    std::vector<Eigen::Vector3d> ordered_path;
+    ordered_path.reserve(msg->poses.size());
+    for (const auto &pose : msg->poses)
+    {
+      ordered_path.emplace_back(
+          pose.pose.position.x, pose.pose.position.y, pose.pose.position.z);
+    }
+
+    const Eigen::Vector3d anchor = have_odom_ ? odom_pos_ : ordered_path.front();
+    const ExplorationReferencePrefix prefix = buildOrderedExplorationPrefix(
+        anchor, ordered_path, planning_horizon_);
+    if (!prefix.valid)
+    {
+      RCLCPP_WARN_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 1000,
+          "Ignore invalid ordered exploration reference path");
+      return;
+    }
+
+    if (have_odom_)
+    {
+      constexpr int kDirectionConfirmations = 2;
+      const Eigen::Vector3d committed_direction =
+          have_target_ ? exploration_direction_ : Eigen::Vector3d::Zero();
+      const ExplorationDirectionDecision decision = considerExplorationDirection(
+          committed_direction, prefix.initial_direction,
+          exploration_direction_replan_threshold_, kDirectionConfirmations,
+          exploration_reference_direction_gate_);
+      if (!decision.accept)
+      {
+        RCLCPP_INFO_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 1000,
+            "Holding ordered exploration path direction change (%d/%d confirmations)",
+            exploration_reference_direction_gate_.pending_count,
+            kDirectionConfirmations);
+        return;
+      }
+      if (decision.request_replan)
+        exploration_early_replan_requested_ = true;
+    }
+
+    exploration_reference_path_ = std::move(ordered_path);
+    exploration_reference_path_time_ = node_->now();
+    exploration_reference_path_received_ = true;
+    exploration_reference_path_pending_ = true;
+    exploration_direction_ = prefix.initial_direction;
+    if (!exploration_home_reached_ || !exploration_finished_)
+      trigger_ = true;
+  }
+
+  void SCANReplanFSM::explorationFinishCallback(
+      const std_msgs::msg::Bool::ConstSharedPtr &msg)
+  {
+    if (!msg)
+      return;
+
+    const bool changed = exploration_finished_ != msg->data;
+    exploration_finished_ = msg->data;
+    if (changed)
+    {
+      exploration_direction_gate_ = ExplorationDirectionGate{};
+      exploration_reference_direction_gate_ = ExplorationDirectionGate{};
+      exploration_reference_path_received_ = false;
+      exploration_reference_path_pending_ = false;
+      exploration_reference_path_.clear();
+    }
+    if (!exploration_finished_)
+      exploration_home_reached_ = false;
+    if (changed && exploration_finished_ && have_target_)
+      exploration_early_replan_requested_ = true;
+  }
+
+  bool SCANReplanFSM::planExplorationGlobalTrajectory()
+  {
+    if (!exploration_home_ready_ || !explorationWaypointIsFresh())
+      return false;
+
+    Eigen::Vector3d map_origin;
+    Eigen::Vector3d map_size;
+    planner_manager_->grid_map_->getRegion(map_origin, map_size);
+    const ExplorationTarget target = computeExplorationTarget(
+        start_pt_, exploration_waypoint_, home_position_, exploration_finished_,
+        planning_horizon_, map_origin, map_size,
+        planner_manager_->grid_map_->getResolution(),
+        exploration_return_stop_distance_);
+
+    bool used_ordered_reference = false;
+    bool global_plan_succeeded = false;
+    ExplorationReferencePrefix reference_prefix;
+    if (!target.fixed_home && exploration_reference_path_pending_ &&
+        explorationReferencePathIsFresh())
+    {
+      reference_prefix = buildOrderedExplorationPrefix(
+          start_pt_, exploration_reference_path_, planning_horizon_);
+      if (reference_prefix.valid)
+      {
+        end_pt_ = reference_prefix.waypoints.back();
+        ExplorationTarget terminal_target;
+        terminal_target.valid = true;
+        terminal_target.direction = reference_prefix.terminal_direction;
+        end_vel_ = explorationTerminalVelocity(
+            terminal_target, planner_manager_->pp_.max_vel_);
+        global_plan_succeeded = planner_manager_->planGlobalTrajWaypoints(
+            start_pt_, start_vel_, start_acc_, reference_prefix.waypoints,
+            end_vel_, Eigen::Vector3d::Zero());
+        used_ordered_reference = global_plan_succeeded;
+        if (!global_plan_succeeded)
+        {
+          RCLCPP_WARN_THROTTLE(
+              node_->get_logger(), *node_->get_clock(), 1000,
+              "Unable to generate trajectory from ordered exploration path; using waypoint fallback");
+        }
+      }
+    }
+
+    if (!global_plan_succeeded && !target.valid)
+    {
+      RCLCPP_WARN_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 1000,
+          "No valid rolling exploration target inside the current map");
+      return false;
+    }
+
+    if (!global_plan_succeeded &&
+        !allowExplorationWaypointFallback(
+            target.fixed_home, exploration_reference_path_received_))
+    {
+      RCLCPP_WARN_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 1000,
+          "Ordered exploration reference is unavailable; refusing waypoint fallback");
+      return false;
+    }
+
+    if (!global_plan_succeeded)
+    {
+      end_pt_ = target.position;
+      end_vel_ = explorationTerminalVelocity(
+          target, planner_manager_->pp_.max_vel_);
+      global_plan_succeeded = planner_manager_->planGlobalTraj(
+          start_pt_, start_vel_, start_acc_, end_pt_, end_vel_,
+          Eigen::Vector3d::Zero());
+      if (!global_plan_succeeded)
+      {
+        RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 1000,
+            "Unable to generate rolling exploration trajectory");
+        return false;
+      }
+    }
+    if (!adjustGlobalTargetIfOccupied())
+      return false;
+
+    exploration_reference_path_pending_ = false;
+    exploration_direction_ = used_ordered_reference
+                                 ? reference_prefix.initial_direction
+                                 : target.direction;
+    exploration_fixed_home_ = !used_ordered_reference && target.fixed_home;
+    have_target_ = true;
+    have_new_target_ = true;
+    init_pt_ = start_pt_;
+
+    constexpr double sample_dt = 0.1;
+    const double duration = planner_manager_->global_data_.global_duration_;
+    std::vector<Eigen::Vector3d> global_traj;
+    global_traj.reserve(static_cast<size_t>(std::ceil(duration / sample_dt)) + 1);
+    for (double t = 0.0; t < duration; t += sample_dt)
+      global_traj.push_back(planner_manager_->global_data_.global_traj_.evaluate(t));
+    global_traj.push_back(planner_manager_->global_data_.global_traj_.evaluate(duration));
+    visualization_->displayGlobalPathList(global_traj, 0.1, 0);
+    visualization_->displayGoalPoint(end_pt_, Eigen::Vector4d(0, 0.5, 0.5, 1), 0.3, 0);
+
+    RCLCPP_INFO_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 1000,
+        "Exploration target [%.2f, %.2f, %.2f], source=%s, fixed_home=%s, terminal_speed=%.2f",
+        end_pt_(0), end_pt_(1), end_pt_(2),
+        used_ordered_reference ? "ordered_reference" : "waypoint_fallback",
+        exploration_fixed_home_ ? "true" : "false", end_vel_.norm());
+    return true;
+  }
+
+  void SCANReplanFSM::stopExpiredExplorationIntent()
+  {
+    RCLCPP_WARN(node_->get_logger(), "Exploration waypoint timed out; stopping current trajectory");
+    need_hover_stop_ = true;
+    flag_escape_emergency_ = true;
+    have_target_ = false;
+    trigger_ = false;
+    exploration_early_replan_requested_ = false;
+    exploration_preserve_on_replan_failure_ = false;
+    exploration_direction_gate_ = ExplorationDirectionGate{};
+    exploration_reference_direction_gate_ = ExplorationDirectionGate{};
+    exploration_reference_path_received_ = false;
+    exploration_reference_path_pending_ = false;
+    exploration_reference_path_.clear();
+    changeFSMExecState(EMERGENCY_STOP, "EXPLORATION_TIMEOUT");
+  }
+
   void SCANReplanFSM::odometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &msg)
   {
     odom_pos_(0) = msg->pose.pose.position.x;
     odom_pos_(1) = msg->pose.pose.position.y;
     odom_pos_(2) = msg->pose.pose.position.z;
+
+    if (isExplorationMode() && !exploration_home_ready_ && odom_pos_.allFinite())
+    {
+      home_position_ = odom_pos_;
+      exploration_home_ready_ = true;
+      RCLCPP_INFO(node_->get_logger(), "Recorded exploration home at [%.2f, %.2f, %.2f]",
+                  home_position_(0), home_position_(1), home_position_(2));
+    }
 
     if (navi_mode_ == NAVI_MODE::MANUAL_TARGET && !rviz_height_ready_)
     {
@@ -499,10 +833,16 @@ namespace scan_planner
     else
       continuously_called_times_ = 1;
 
-    static string state_str[7] = {"INIT", "WAIT_TARGET", "GEN_NEW_TRAJ", "REPLAN_TRAJ", "EXEC_TRAJ", "EMERGENCY_STOP"};
+    static string state_str[6] = {"INIT", "WAIT_TARGET", "GEN_NEW_TRAJ", "REPLAN_TRAJ", "EXEC_TRAJ", "EMERGENCY_STOP"};
     int pre_s = int(exec_state_);
     exec_state_ = new_state;
     cout << "[" + pos_call + "]: from " + state_str[pre_s] + " to " + state_str[int(new_state)] << endl;
+    if (fsm_state_pub_ && pre_s != int(new_state))
+    {
+      std_msgs::msg::String message;
+      message.data = state_str[int(new_state)];
+      fsm_state_pub_->publish(message);
+    }
   }
 
   std::pair<int, SCANReplanFSM::FSM_EXEC_STATE> SCANReplanFSM::timesOfConsecutiveStateCalls()
@@ -512,7 +852,7 @@ namespace scan_planner
 
   void SCANReplanFSM::printFSMExecState()
   {
-    static string state_str[7] = {"INIT", "WAIT_TARGET", "GEN_NEW_TRAJ", "REPLAN_TRAJ", "EXEC_TRAJ", "EMERGENCY_STOP"};
+    static string state_str[6] = {"INIT", "WAIT_TARGET", "GEN_NEW_TRAJ", "REPLAN_TRAJ", "EXEC_TRAJ", "EMERGENCY_STOP"};
 
     cout << "[FSM]: state: " + state_str[int(exec_state_)] << endl;
   }
@@ -520,6 +860,14 @@ namespace scan_planner
   void SCANReplanFSM::execFSMCallback()
   {
     updateLocalTrajTimeFreeze();
+
+    if (isExplorationMode() && have_target_ && !exploration_fixed_home_ &&
+        exec_state_ != INIT && exec_state_ != WAIT_TARGET &&
+        exec_state_ != EMERGENCY_STOP && !explorationWaypointIsFresh())
+    {
+      stopExpiredExplorationIntent();
+      return;
+    }
 
     static int fsm_num = 0;
     fsm_num++;
@@ -551,6 +899,16 @@ namespace scan_planner
 
     case WAIT_TARGET:
     {
+      if (isExplorationMode() && !have_target_)
+      {
+        if (exploration_home_reached_ || !explorationWaypointIsFresh())
+          return;
+        setStartStateFromOdomOrCurrentTraj();
+        if (!planExplorationGlobalTrajectory())
+          return;
+        changeFSMExecState(GEN_NEW_TRAJ, "EXPLORATION");
+        break;
+      }
       if (!have_target_)
         return;
       else
@@ -596,10 +954,21 @@ namespace scan_planner
       if (planFromCurrentTraj())
       {
         replan_fail_count_ = 0;
+        exploration_preserve_on_replan_failure_ = false;
         changeFSMExecState(EXEC_TRAJ, "FSM");
+      }
+      else if (isExplorationMode() && exploration_preserve_on_replan_failure_ &&
+               explorationWaypointIsFresh() && hasActiveLocalTrajectory())
+      {
+        replan_fail_count_++;
+        exploration_preserve_on_replan_failure_ = false;
+        RCLCPP_WARN(node_->get_logger(),
+                    "Early exploration replan failed; keeping the active trajectory");
+        changeFSMExecState(EXEC_TRAJ, "EXPLORATION_KEEP");
       }
       else
       {
+        exploration_preserve_on_replan_failure_ = false;
         replan_fail_count_++;
         visualization_->clearOptimalTraj(0);
         callEmergencyStop(odom_pos_);
@@ -619,6 +988,15 @@ namespace scan_planner
 
       Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t_cur);
 
+      if (isExplorationMode() && shouldStartExplorationReplan(
+              exploration_early_replan_requested_, go2_execution_frozen_))
+      {
+        exploration_early_replan_requested_ = false;
+        exploration_preserve_on_replan_failure_ = true;
+        changeFSMExecState(REPLAN_TRAJ, "EXPLORATION_DIRECTION");
+        return;
+      }
+
       if (isWaypointSequenceMode() &&
           current_wp_ + 1 < (int)active_waypoints_.size() &&
           (end_pt_ - odom_pos_).norm() < 0.5)
@@ -637,6 +1015,37 @@ namespace scan_planner
       /* && (end_pt_ - pos).norm() < 0.5 */
       if (t_cur > info->duration_ - 1e-2)
       {
+        if (isExplorationMode())
+        {
+          if (exploration_fixed_home_)
+          {
+            exploration_home_reached_ = true;
+            have_target_ = false;
+            trigger_ = false;
+            changeFSMExecState(WAIT_TARGET, "EXPLORATION_HOME");
+            return;
+          }
+
+          if (explorationWaypointIsFresh())
+          {
+            setStartStateFromOdomOrCurrentTraj();
+            if (planExplorationGlobalTrajectory())
+            {
+              changeFSMExecState(GEN_NEW_TRAJ, "EXPLORATION_ROLL");
+              return;
+            }
+          }
+
+          RCLCPP_WARN(node_->get_logger(),
+                      "Exploration trajectory ended without a valid continuation; stopping");
+          need_hover_stop_ = true;
+          flag_escape_emergency_ = true;
+          have_target_ = false;
+          trigger_ = false;
+          changeFSMExecState(EMERGENCY_STOP, "EXPLORATION_END");
+          return;
+        }
+
         if (isWaypointSequenceMode() && current_wp_ + 1 < (int)active_waypoints_.size())
         {
           current_wp_++;
@@ -737,14 +1146,25 @@ namespace scan_planner
     start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
     start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
 
-    const Eigen::Vector2d to_goal = end_pt_.head<2>() - odom_pos_.head<2>();
+    Eigen::Vector2d to_goal = end_pt_.head<2>() - odom_pos_.head<2>();
+    if (isExplorationMode() && exploration_direction_.head<2>().norm() > 1e-3)
+      to_goal = exploration_direction_.head<2>();
     if (to_goal.norm() > 1e-3 && start_vel_.head<2>().dot(to_goal) < 0.0)
     {
       start_vel_.setZero();
       start_acc_.setZero();
     }
 
-    if (navi_mode_ == NAVI_MODE::REFERENCE_PATH)
+    if (isExplorationMode())
+    {
+      const bool keep_active_ordered_reference =
+          explorationReferencePathIsFresh() &&
+          !exploration_reference_path_pending_ &&
+          planner_manager_->global_data_.global_duration_ > 1e-3;
+      if (!keep_active_ordered_reference && !planExplorationGlobalTrajectory())
+        return false;
+    }
+    else if (navi_mode_ == NAVI_MODE::REFERENCE_PATH)
     {
       // The reference-path mode owns a multi-waypoint global trajectory. Do
       // not replace it with a shortcut from the current pose to the final
@@ -769,7 +1189,7 @@ namespace scan_planner
       return false;
     }
 
-    if (!adjustGlobalTargetIfOccupied())
+    if (!isExplorationMode() && !adjustGlobalTargetIfOccupied())
       return false;
 
     bool success = callReboundReplan(true, false);
@@ -801,7 +1221,9 @@ namespace scan_planner
     start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
     start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
 
-    const Eigen::Vector2d to_goal = end_pt_.head<2>() - odom_pos_.head<2>();
+    Eigen::Vector2d to_goal = end_pt_.head<2>() - odom_pos_.head<2>();
+    if (isExplorationMode() && exploration_direction_.head<2>().norm() > 1e-3)
+      to_goal = exploration_direction_.head<2>();
     if (to_goal.norm() > 1e-3 && start_vel_.head<2>().dot(to_goal) < 0.0)
     {
       start_vel_.setZero();
@@ -1055,16 +1477,22 @@ namespace scan_planner
       }
     }
 
-    if ((end_pt_ - local_target_pt_).norm() < (planner_manager_->pp_.max_vel_ * planner_manager_->pp_.max_vel_) / (2 * planner_manager_->pp_.max_acc_))
+    if (!isExplorationMode() || exploration_fixed_home_)
     {
-      // local_target_vel_ = (end_pt_ - init_pt_).normalized() * planner_manager_->pp_.max_vel_ * (( end_pt_ - local_target_pt_ ).norm() / ((planner_manager_->pp_.max_vel_*planner_manager_->pp_.max_vel_)/(2*planner_manager_->pp_.max_acc_)));
-      // cout << "A" << endl;
-      local_target_vel_ = Eigen::Vector3d::Zero();
+      if ((end_pt_ - local_target_pt_).norm() <
+          (planner_manager_->pp_.max_vel_ * planner_manager_->pp_.max_vel_) /
+              (2 * planner_manager_->pp_.max_acc_))
+      {
+        local_target_vel_ = Eigen::Vector3d::Zero();
+      }
+      else
+      {
+        local_target_vel_ = planner_manager_->global_data_.getVelocity(target_t);
+      }
     }
     else
     {
       local_target_vel_ = planner_manager_->global_data_.getVelocity(target_t);
-      // cout << "AA" << endl;
     }
 
     displayRemainingGlobalPath();

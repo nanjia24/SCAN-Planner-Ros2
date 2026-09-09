@@ -3,17 +3,20 @@
 
 #include <Eigen/Eigen>
 #include <algorithm>
+#include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <iostream>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <vector>
 #include <visualization_msgs/msg/marker.hpp>
 
 #include <bspline_opt/bspline_optimizer.h>
 #include <plan_env/grid_map.h>
+#include <plan_manage/exploration_intent.hpp>
 #include <scan_planner_msgs/msg/bspline.hpp>
 #include <scan_planner_msgs/msg/data_disp.hpp>
 #include <plan_manage/planner_manager.h>
@@ -43,6 +46,7 @@ namespace scan_planner
       MANUAL_TARGET = 1,
       PRESET_TARGET = 2,
       REFERENCE_PATH = 3,
+      EXPLORATION = 4,
     };
 
     /* planning utils */
@@ -57,6 +61,9 @@ namespace scan_planner
     int waypoint_num_;
     double planning_horizon_;
     double emergency_time_;
+    double exploration_direction_replan_threshold_;
+    double exploration_waypoint_timeout_;
+    double exploration_return_stop_distance_;
     double rviz_goal_height_;
     double self_inflation_z_up_, self_inflation_z_down_;
     double self_double_cylinder_radius_, self_double_cylinder_offset_;
@@ -66,6 +73,15 @@ namespace scan_planner
     /* planning data */
     bool trigger_, have_target_, have_odom_, have_new_target_;
     bool preset_started_{false};
+    bool exploration_waypoint_received_{false};
+    bool exploration_reference_path_received_{false};
+    bool exploration_reference_path_pending_{false};
+    bool exploration_finished_{false};
+    bool exploration_home_ready_{false};
+    bool exploration_fixed_home_{false};
+    bool exploration_home_reached_{false};
+    bool exploration_early_replan_requested_{false};
+    bool exploration_preserve_on_replan_failure_{false};
     bool rviz_height_ready_;
     bool go2_execution_frozen_;
     bool enable_fail_safe_, need_hover_stop_;
@@ -74,6 +90,8 @@ namespace scan_planner
     int replan_fail_count_{0};
     int max_replan_fail_count_{1000};
     rclcpp::Time last_freeze_update_time_;
+    rclcpp::Time exploration_waypoint_time_{0, 0, RCL_ROS_TIME};
+    rclcpp::Time exploration_reference_path_time_{0, 0, RCL_ROS_TIME};
 
     Eigen::Vector3d odom_pos_, odom_vel_, odom_acc_; // odometry state
     Eigen::Quaterniond odom_orient_;
@@ -81,6 +99,10 @@ namespace scan_planner
     Eigen::Vector3d init_pt_, start_pt_, start_vel_, start_acc_, start_yaw_; // start state
     Eigen::Vector3d end_pt_, end_vel_;                                       // goal state
     Eigen::Vector3d local_target_pt_, local_target_vel_;                     // local target state
+    Eigen::Vector3d exploration_waypoint_, exploration_direction_, home_position_;
+    ExplorationDirectionGate exploration_direction_gate_;
+    ExplorationDirectionGate exploration_reference_direction_gate_;
+    std::vector<Eigen::Vector3d> exploration_reference_path_;
     std::vector<Eigen::Vector3d> active_waypoints_;
     int current_wp_;
 
@@ -90,17 +112,26 @@ namespace scan_planner
     rclcpp::Node *node_{nullptr};
     rclcpp::TimerBase::SharedPtr exec_timer_, safety_timer_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr exploration_waypoint_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr go2_execution_frozen_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr exploration_finish_sub_;
     rclcpp::Publisher<scan_planner_msgs::msg::Bspline>::SharedPtr bspline_pub_;
     rclcpp::Publisher<scan_planner_msgs::msg::DataDisp>::SharedPtr data_disp_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr fsm_state_pub_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr self_inflation_pub_;
 
     /* helper functions */
     bool callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj); // front-end and back-end method
     bool callEmergencyStop(Eigen::Vector3d stop_pos);                          // front-end and back-end method
     bool planFromCurrentTraj();
+    bool planExplorationGlobalTrajectory();
+    bool explorationWaypointIsFresh() const;
+    bool explorationReferencePathIsFresh() const;
+    bool hasActiveLocalTrajectory() const;
+    bool isExplorationMode() const;
+    void stopExpiredExplorationIntent();
     void setStartStateFromOdomOrCurrentTraj();
 
     /* return value: std::pair< Times of the same state be continuously called, current continuously called state > */
@@ -126,6 +157,9 @@ namespace scan_planner
     void checkCollisionCallback();
     void rvizGoalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg);
     void waypointCallback(const nav_msgs::msg::Path::ConstSharedPtr &msg);
+    void explorationWaypointCallback(const geometry_msgs::msg::PointStamped::ConstSharedPtr &msg);
+    void explorationReferencePathCallback(const nav_msgs::msg::Path::ConstSharedPtr &msg);
+    void explorationFinishCallback(const std_msgs::msg::Bool::ConstSharedPtr &msg);
     void pathCallback(const nav_msgs::msg::Path::ConstSharedPtr &msg);
     void odometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &msg);
     void go2ExecutionFrozenCallback(const std_msgs::msg::Bool::ConstSharedPtr &msg);
