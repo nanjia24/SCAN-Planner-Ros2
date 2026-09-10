@@ -343,23 +343,19 @@ namespace scan_planner
         pos = UniformBspline(optimal_control_points, 3, ts);
     }
 
-    bool dynamically_feasible = flag_step_2_success;
     constexpr int max_retiming_attempts = 3;
-    for (int attempt = 0; dynamically_feasible && attempt <= max_retiming_attempts; ++attempt)
-    {
-      double required_scale = 1.0;
-      dynamically_feasible = checkDynamicFeasibility(
-        pos, &required_scale, attempt == max_retiming_attempts);
-      if (dynamically_feasible || attempt == max_retiming_attempts)
-        break;
-
-      const double applied_scale = std::max(1.02, required_scale * 1.02);
-      RCLCPP_WARN(
-        node_->get_logger(),
-        "Retiming dynamically infeasible trajectory: attempt=%d/%d scale=%.3f",
-        attempt + 1, max_retiming_attempts, applied_scale);
-      pos.lengthenTime(applied_scale);
-    }
+    const bool dynamically_feasible = flag_step_2_success && retimeUntilFeasible(
+      max_retiming_attempts,
+      [this, &pos](double * required_scale, const bool log_failure) {
+        return checkDynamicFeasibility(pos, required_scale, log_failure);
+      },
+      [this, &pos](const double applied_scale, const int attempt, const int max_attempts) {
+        RCLCPP_WARN(
+          node_->get_logger(),
+          "Retiming dynamically infeasible trajectory: attempt=%d/%d scale=%.3f",
+          attempt, max_attempts, applied_scale);
+        pos.lengthenTime(applied_scale);
+      });
 
     if (!flag_step_2_success || !dynamically_feasible)
     {
