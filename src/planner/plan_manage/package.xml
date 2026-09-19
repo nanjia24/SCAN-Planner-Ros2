@@ -26,13 +26,8 @@
   <depend>traj_utils</depend>
   <depend>visualization_msgs</depend>
 
-  <exec_depend>go2_description</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
-  <exec_depend>local_sensing_node</exec_depend>
-  <exec_depend>map_generator</exec_depend>
-  <exec_depend>mockamap</exec_depend>
-  <exec_depend>odom_visualization</exec_depend>
   <exec_depend>robot_state_publisher</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>xacro</exec_depend>

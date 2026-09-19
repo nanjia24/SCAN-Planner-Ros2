@@ -46,7 +46,7 @@ public:
   }
 
 private:
-  static constexpr double kMaxVYawLimit = 1.0;
+  static constexpr double kMaxVYawLimit = 2.0943951023931953;  // 120 deg/s
 
   static double normalizeAngle(double angle)
   {
