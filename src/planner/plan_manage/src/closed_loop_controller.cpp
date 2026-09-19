@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 #include <Eigen/Eigen>
@@ -24,12 +25,18 @@ public:
   {
     time_forward_ = declare_parameter<double>("time_forward", 0.8);
     heading_error_threshold_ = declare_parameter<double>("heading_error_threshold", 0.8);
+    heading_error_release_threshold_ =
+        declare_parameter<double>("heading_error_release_threshold", 0.4);
     kp_pos_ = declare_parameter<double>("kp_pos", 0.8);
     kp_yaw_ = declare_parameter<double>("kp_yaw", 1.5);
     max_vx_ = declare_parameter<double>("max_vx", 0.75);
     max_vy_ = declare_parameter<double>("max_vy", 0.35);
     max_vyaw_ = std::min(declare_parameter<double>("max_vyaw", 1.0), kMaxVYawLimit);
     finish_dist_ = declare_parameter<double>("finish_dist", 0.15);
+    if (heading_error_release_threshold_ < 0.0 ||
+        heading_error_release_threshold_ > heading_error_threshold_)
+      throw std::invalid_argument(
+          "heading_error_release_threshold must be within [0, heading_error_threshold]");
 
     bspline_sub_ = create_subscription<scan_planner_msgs::msg::Bspline>(
         "planning/bspline", 10,
@@ -132,7 +139,12 @@ private:
     Eigen::Vector3d pos_des = traj_[0].evaluateDeBoorT(t_eval);
     const double yaw_error = normalizeAngle(estimateDesiredYaw(t_eval, pos_des) - odom_yaw_);
     const double yaw_command = std::clamp(kp_yaw_ * yaw_error, -max_vyaw_, max_vyaw_);
-    if (std::abs(yaw_error) > heading_error_threshold_)
+    const double absolute_yaw_error = std::abs(yaw_error);
+    if (rotating_in_place_)
+      rotating_in_place_ = absolute_yaw_error > heading_error_release_threshold_;
+    else
+      rotating_in_place_ = absolute_yaw_error > heading_error_threshold_;
+    if (rotating_in_place_)
     {
       publishExecutionFrozen(true);
       publishStop(yaw_command);
@@ -167,6 +179,7 @@ private:
   rclcpp::TimerBase::SharedPtr cmd_timer_;
   bool receive_traj_{false};
   bool have_odom_{false};
+  bool rotating_in_place_{false};
   std::vector<UniformBspline> traj_;
   double traj_duration_{0.0};
   std::int64_t traj_id_{0};
@@ -174,7 +187,8 @@ private:
   double odom_yaw_{0.0};
   double exec_time_{0.0};
   rclcpp::Time last_update_time_{0, 0, RCL_ROS_TIME};
-  double time_forward_, heading_error_threshold_, kp_pos_, kp_yaw_;
+  double time_forward_, heading_error_threshold_, heading_error_release_threshold_;
+  double kp_pos_, kp_yaw_;
   double max_vx_, max_vy_, max_vyaw_, finish_dist_;
 };
 }  // namespace scan_planner
