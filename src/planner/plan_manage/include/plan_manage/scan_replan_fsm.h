@@ -2,6 +2,13 @@
 #define _SCAN_REPLAN_FSM_H_
 
 #include <Eigen/Eigen>
+#include <gbplanner3_interfaces/msg/local_goal.hpp>
+#include <gbplanner3_interfaces/msg/execution_observation.hpp>
+#include <gbplanner3_interfaces/msg/planning_result.hpp>
+#include <gbplanner3_interfaces/msg/scan_trajectory.hpp>
+#include <set>
+#include <functional>
+#include <tuple>
 #include <algorithm>
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
@@ -17,6 +24,7 @@
 #include <bspline_opt/bspline_optimizer.h>
 #include <plan_env/grid_map.h>
 #include <plan_manage/exploration_intent.hpp>
+#include <plan_manage/rolling_height.hpp>
 #include <scan_planner_msgs/msg/bspline.hpp>
 #include <scan_planner_msgs/msg/data_disp.hpp>
 #include <plan_manage/planner_manager.h>
@@ -31,6 +39,39 @@ namespace scan_planner
   {
 
   private:
+    friend class SCANHandoffTestPeer;
+    // Opt-in identity boundary; executor alone acknowledges physical execution.
+    bool contract_planning_only_{false};
+    bool contract_mode_{false};
+    bool allow_goal_handoff_{false};
+    std::function<void()> handoff_commit_;
+    gbplanner3_interfaces::msg::LocalGoal handoff_goal_;
+    uint64_t handoff_trajectory_id_{0};
+    std::function<void()> captureContractState();
+    void discardHandoff(const std::string &reason);
+    rclcpp::Subscription<gbplanner3_interfaces::msg::ExecutionObservation>::SharedPtr contract_events_sub_, contract_observation_sub_;
+    void retireContract();
+    void contractExecutionCallback(gbplanner3_interfaces::msg::ExecutionObservation::ConstSharedPtr msg);
+    bool contract_active_{false};
+    bool contract_effective_goal_valid_{false};
+    int contract_failures_{0};
+    std_msgs::msg::Header contract_odom_header_;
+    gbplanner3_interfaces::msg::LocalGoal contract_goal_;
+    bool ground_height_follow_{false};
+    RollingHeight ground_height_;
+    double ground_goal_height_{0.};
+    std::set<std::tuple<uint64_t, uint64_t, uint64_t>> contract_seen_;
+    rclcpp::Subscription<gbplanner3_interfaces::msg::LocalGoal>::SharedPtr contract_sub_;
+    rclcpp::Publisher<gbplanner3_interfaces::msg::PlanningResult>::SharedPtr contract_pub_;
+    rclcpp::Publisher<gbplanner3_interfaces::msg::ScanTrajectory>::SharedPtr contract_trajectory_pub_;
+    scan_planner_msgs::msg::Bspline contract_native_trajectory_;
+    rclcpp::Publisher<gbplanner3_interfaces::msg::ScanTrajectory>::SharedPtr goal_trajectory_pub_;
+    geometry_msgs::msg::PoseStamped manual_view_goal_;
+    bool manual_view_goal_valid_{false};
+    void publishGoalTrajectory(const scan_planner_msgs::msg::Bspline &trajectory, bool emergency = false);
+    void contractGoalCallback(gbplanner3_interfaces::msg::LocalGoal::ConstSharedPtr msg);
+    void contractResult(const gbplanner3_interfaces::msg::LocalGoal &goal, uint8_t status,
+                        const std::string &reason, uint64_t trajectory = 0);
     /* ---------- flag ---------- */
     enum FSM_EXEC_STATE
     {
@@ -60,6 +101,7 @@ namespace scan_planner
     std::vector<Eigen::Vector3d> preset_waypoints_;
     int waypoint_num_;
     double planning_horizon_;
+    double reference_segment_reached_tolerance_{0.20};
     double emergency_time_;
     double exploration_direction_replan_threshold_;
     double exploration_waypoint_timeout_;
@@ -145,7 +187,7 @@ namespace scan_planner
     bool isWaypointSequenceMode() const;
     bool adjustGlobalTargetIfOccupied();
     void displayRemainingGlobalPath();
-    void getLocalTarget();
+    double getLocalTarget();
     void finishProcess();
     void publishSelfInflationMarker();
     double getOdomYaw() const;

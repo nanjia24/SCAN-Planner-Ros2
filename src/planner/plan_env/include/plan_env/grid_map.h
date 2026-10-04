@@ -1,3 +1,4 @@
+#include <map>
 #ifndef _GRID_MAP_H
 #define _GRID_MAP_H
 
@@ -17,6 +18,7 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_msgs/msg/header.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <visualization_msgs/msg/marker.hpp>
 
@@ -150,6 +152,10 @@ struct MappingData {
 class GridMap {
 public:
   GridMap() {}
+private:
+  int64_t pending_cloud_stamp_ns_{0};
+  int64_t integrated_cloud_stamp_ns_{0};
+public:
   ~GridMap() {}
 
   enum { INVALID_IDX = -10000 };
@@ -188,6 +194,8 @@ public:
   void publishSlidingMapBBox();
   void publishSlidingMapFrame();
 
+  // Read-only provenance of a nonempty lidar batch after occupancy integration.
+  int64_t lastIntegratedCloudStampNs() const { return integrated_cloud_stamp_ns_; }
   bool hasDepthObservation();
   bool odomValid();
   void getRegion(Eigen::Vector3d& ori, Eigen::Vector3d& size);
@@ -200,6 +208,7 @@ public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
 private:
+  friend class GridMapSegmentedTest;
   MappingParameters mp_;
   MappingData md_;
 
@@ -209,6 +218,26 @@ private:
   void sensorPoseCallback(const nav_msgs::msg::Odometry::ConstSharedPtr& pose);
   void slidingMapFrameCallback(const nav_msgs::msg::Odometry::ConstSharedPtr& pose);
   void cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& img);
+  void segmentedCloudCallback(sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud, bool ground);
+  void integrateCloudPair(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud,
+                          const sensor_msgs::msg::PointCloud2::ConstSharedPtr& ground);
+  bool use_segmented_cloud_ = false;
+  std::string segmented_cloud_frame_;
+  bool segmented_batch_ = false;
+  std::vector<bool> projected_hits_;
+  struct CloudPair {
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr obstacle, ground;
+  };
+  std::map<int64_t, CloudPair> cloud_pairs_;
+  size_t pair_queue_depth_ = 5;
+  struct SensorPose {
+    Eigen::Vector3d position;
+    Eigen::Quaterniond orientation;
+  };
+  std::map<int64_t, SensorPose> sensor_poses_;
+  bool setSegmentedPose(int64_t stamp);
+  void consumeCloudPairs();
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr ground_cloud_sub_;
 
   // update occupancy by raycasting
   void updateOccupancyCallback();
@@ -257,6 +286,8 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr lidar_pose_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sliding_map_frame_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
+  bool integrate_cloud_on_receipt_ = false;
+  rclcpp::Publisher<std_msgs::msg::Header>::SharedPtr integrated_cloud_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_inf_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr sliding_map_bbox_pub_;

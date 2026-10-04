@@ -1,5 +1,8 @@
+#include <plan_manage/reference_path_utils.h>
+#include "plan_env/callback_timing.h"
 
 #include <plan_manage/scan_replan_fsm.h>
+#include <plan_manage/goal_feedback.hpp>
 #include <cmath>
 #include <stdexcept>
 
@@ -36,10 +39,18 @@ namespace scan_planner
         rclcpp::Time(0, 0, node_->get_clock()->get_clock_type());
 
     /*  fsm param  */
+    contract_planning_only_ = load_parameter<bool>(node_, "fsm.contract_planning_only", false);
+    contract_mode_ = contract_planning_only_ || load_parameter<bool>(node_, "fsm.contract_mode", false);
+    allow_goal_handoff_ = load_parameter<bool>(node_, "fsm.allow_goal_handoff", false);
     navi_mode_ = load_parameter<int>(node_, "fsm.navi_mode", -1);
+    ground_height_follow_ = load_parameter<bool>(node_, "fsm.ground_height_follow", false);
     replan_thresh_ = load_parameter<double>(node_, "fsm.thresh_replan", -1.0);
     no_replan_thresh_ = load_parameter<double>(node_, "fsm.thresh_no_replan", -1.0);
     planning_horizon_ = load_parameter<double>(node_, "fsm.planning_horizon", -1.0);
+    reference_segment_reached_tolerance_ = load_parameter<double>(
+        node_, "fsm.reference_segment_reached_tolerance", 0.20);
+    if (!std::isfinite(reference_segment_reached_tolerance_) || reference_segment_reached_tolerance_ <= 0)
+      throw std::runtime_error("invalid reference segment reached tolerance");
     emergency_time_ = load_parameter<double>(node_, "fsm.emergency_time", 1.0);
     exploration_direction_replan_threshold_ = load_parameter<double>(
         node_, "fsm.exploration_direction_replan_threshold", 0.5);
@@ -88,6 +99,7 @@ namespace scan_planner
         std::bind(&SCANReplanFSM::go2ExecutionFrozenCallback, this, std::placeholders::_1));
 
     bspline_pub_ = node_->create_publisher<scan_planner_msgs::msg::Bspline>("planning/bspline", 10);
+    goal_trajectory_pub_ = node_->create_publisher<gbplanner3_interfaces::msg::ScanTrajectory>("planning/goal_trajectory", 10);
     data_disp_pub_ = node_->create_publisher<scan_planner_msgs::msg::DataDisp>("planning/data_display", 100);
     fsm_state_pub_ = node_->create_publisher<std_msgs::msg::String>(
         "planning/fsm_state", rclcpp::QoS(1).reliable().transient_local());
@@ -97,7 +109,20 @@ namespace scan_planner
     initial_fsm_state.data = "INIT";
     fsm_state_pub_->publish(initial_fsm_state);
 
-    if (navi_mode_ == NAVI_MODE::MANUAL_TARGET)
+    if (contract_mode_)
+    {
+      if (navi_mode_ != NAVI_MODE::MANUAL_TARGET && navi_mode_ != NAVI_MODE::REFERENCE_PATH)
+        throw std::runtime_error("contract mode requires navi_mode=1 or 3");
+      contract_pub_ = node_->create_publisher<gbplanner3_interfaces::msg::PlanningResult>("planning/contract_result", 10);
+      contract_trajectory_pub_ = node_->create_publisher<gbplanner3_interfaces::msg::ScanTrajectory>("planning/contract_trajectory", 10);
+      contract_events_sub_ = node_->create_subscription<gbplanner3_interfaces::msg::ExecutionObservation>(
+          "planning/execution_events", 10, std::bind(&SCANReplanFSM::contractExecutionCallback, this, std::placeholders::_1));
+      contract_observation_sub_ = node_->create_subscription<gbplanner3_interfaces::msg::ExecutionObservation>(
+          "planning/execution_observation", 10, std::bind(&SCANReplanFSM::contractExecutionCallback, this, std::placeholders::_1));
+      contract_sub_ = node_->create_subscription<gbplanner3_interfaces::msg::LocalGoal>(
+          "planning/local_goal", 10, std::bind(&SCANReplanFSM::contractGoalCallback, this, std::placeholders::_1));
+    }
+    else if (navi_mode_ == NAVI_MODE::MANUAL_TARGET)
       goal_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
           "move_base_simple/goal", 1,
           std::bind(&SCANReplanFSM::rvizGoalCallback, this, std::placeholders::_1));
@@ -123,6 +148,288 @@ namespace scan_planner
     }
     else
       throw std::runtime_error("fsm.navi_mode must be 1, 2, 3, or 4");
+  }
+
+  void SCANReplanFSM::contractResult(const gbplanner3_interfaces::msg::LocalGoal &goal,
+      uint8_t status, const std::string &reason, uint64_t trajectory)
+  {
+    gbplanner3_interfaces::msg::PlanningResult result;
+    result.header.stamp = node_->now();
+    result.header.frame_id = goal.header.frame_id;
+    result.exploration_session_id = goal.exploration_session_id;
+    result.goal_id = goal.goal_id;
+    result.planning_attempt_id = goal.planning_attempt_id;
+    result.trajectory_id = trajectory;
+    result.status = status;
+    result.reason = reason;
+    RCLCPP_INFO(node_->get_logger(),
+        "SCAN_CONTRACT_RESULT session=%llu goal=%llu attempt=%llu trajectory=%llu status=%u reason=%s",
+        static_cast<unsigned long long>(goal.exploration_session_id),
+        static_cast<unsigned long long>(goal.goal_id),
+        static_cast<unsigned long long>(goal.planning_attempt_id),
+        static_cast<unsigned long long>(trajectory), static_cast<unsigned>(status), reason.c_str());
+    result.requested_goal = goal.pose;
+    const bool same_goal = contract_active_ &&
+      goal.exploration_session_id == contract_goal_.exploration_session_id &&
+      goal.goal_id == contract_goal_.goal_id &&
+      goal.planning_attempt_id == contract_goal_.planning_attempt_id;
+    if (same_goal && contract_effective_goal_valid_) {
+      result.effective_goal_valid = true;
+      result.effective_goal = goal.pose;
+      result.effective_goal.position.x = end_pt_.x();
+      result.effective_goal.position.y = end_pt_.y();
+      result.effective_goal.position.z = end_pt_.z();
+      result.goal_adjusted = goalPositionAdjusted(goal.pose, result.effective_goal);
+    }
+    if (status == gbplanner3_interfaces::msg::PlanningResult::READY && same_goal) {
+      const auto &info = planner_manager_->local_data_;
+      result.trajectory_start_time = info.start_time_;
+      const Eigen::Vector3d endpoint = info.position_traj_.evaluateDeBoorT(info.duration_);
+      result.trajectory_end.x = endpoint.x();
+      result.trajectory_end.y = endpoint.y();
+      result.trajectory_end.z = endpoint.z();
+      // One atomic publication binds the exact spline to the full goal identity.
+      // Native Bspline arrival order or its process-local ID alone is insufficient.
+      gbplanner3_interfaces::msg::ScanTrajectory envelope;
+      envelope.result = result;
+      envelope.trajectory = contract_native_trajectory_;
+      contract_trajectory_pub_->publish(envelope);
+    }
+    contract_pub_->publish(result);
+  }
+
+  // Only planning intent is snapshotted. Live odometry and the map keep updating.
+  // Preserve the highest allocated trajectory ID even when a candidate rolls back.
+  std::function<void()> SCANReplanFSM::captureContractState()
+  {
+    const double adopted_height = ground_goal_height_;
+    const auto goal = contract_goal_;
+    const auto native = contract_native_trajectory_;
+    const auto local = planner_manager_->local_data_;
+    const auto global = planner_manager_->global_data_;
+    const auto state = exec_state_;
+    const auto init = init_pt_, start = start_pt_, velocity = start_vel_, acceleration = start_acc_;
+    const auto end = end_pt_, end_velocity = end_vel_, target = local_target_pt_, target_velocity = local_target_vel_;
+    const bool active = contract_active_, effective = contract_effective_goal_valid_;
+    const bool trigger = trigger_, have_target = have_target_, new_target = have_new_target_;
+    const bool escape = flag_escape_emergency_;
+    const int failures = contract_failures_, replan_failures = replan_fail_count_;
+    return [this, adopted_height, goal, native, local, global, state, init, start, velocity, acceleration,
+            end, end_velocity, target, target_velocity, active, effective, trigger,
+            have_target, new_target, escape, failures, replan_failures]() {
+      const auto allocated = planner_manager_->local_data_.traj_id_;
+      ground_goal_height_ = adopted_height;
+      contract_goal_ = goal;
+      contract_native_trajectory_ = native;
+      planner_manager_->local_data_ = local;
+      planner_manager_->local_data_.traj_id_ = std::max(allocated, local.traj_id_);
+      planner_manager_->global_data_ = global;
+      exec_state_ = state;
+      init_pt_ = init; start_pt_ = start; start_vel_ = velocity; start_acc_ = acceleration;
+      end_pt_ = end; end_vel_ = end_velocity;
+      local_target_pt_ = target; local_target_vel_ = target_velocity;
+      contract_active_ = active; contract_effective_goal_valid_ = effective;
+      trigger_ = trigger; have_target_ = have_target; have_new_target_ = new_target;
+      flag_escape_emergency_ = escape;
+      contract_failures_ = failures; replan_fail_count_ = replan_failures;
+    };
+  }
+
+  void SCANReplanFSM::discardHandoff(const std::string &reason)
+  {
+    if (!handoff_commit_) return;
+    handoff_commit_ = {};
+    contractResult(handoff_goal_, gbplanner3_interfaces::msg::PlanningResult::BLOCKED,
+                   reason, handoff_trajectory_id_);
+  }
+
+  void SCANReplanFSM::retireContract()
+  {
+    discardHandoff("HANDOFF_ACTIVE_GOAL_RETIRED_STOP_REQUIRED");
+    contract_active_ = false;
+    have_target_ = false;
+    have_new_target_ = false;
+    trigger_ = false;
+    changeFSMExecState(WAIT_TARGET, "CONTRACT_RETIRED");
+  }
+
+  void SCANReplanFSM::contractExecutionCallback(
+      gbplanner3_interfaces::msg::ExecutionObservation::ConstSharedPtr msg)
+  {
+    using Observation = gbplanner3_interfaces::msg::ExecutionObservation;
+    if (handoff_commit_ && msg->exploration_session_id == handoff_goal_.exploration_session_id &&
+        msg->goal_id == handoff_goal_.goal_id &&
+        msg->planning_attempt_id == handoff_goal_.planning_attempt_id &&
+        (msg->trajectory_id == 0 || msg->trajectory_id == handoff_trajectory_id_)) {
+      if (msg->status == Observation::RUNNING) {
+        if (msg->reason != "CONTROLLER_ACCEPTED" || msg->trajectory_id == 0 ||
+            msg->trajectory_id != handoff_trajectory_id_) return;
+        auto commit = std::move(handoff_commit_);
+        handoff_commit_ = {};
+        commit();
+        RCLCPP_INFO(node_->get_logger(), "SCAN_HANDOFF_COMMITTED goal=%llu trajectory=%llu",
+          static_cast<unsigned long long>(contract_goal_.goal_id),
+          static_cast<unsigned long long>(handoff_trajectory_id_));
+      } else {
+        handoff_commit_ = {};
+        if (msg->reason == "HANDOFF_REJECTED_KEEP_PREVIOUS") {
+          RCLCPP_WARN(node_->get_logger(), "SCAN_HANDOFF_REJECTED_KEEP_PREVIOUS reason=%s", msg->reason.c_str());
+        } else {
+          // Once READY was published the controller may already have switched.
+          // Only an explicit rejected START proves that restoring old intent is valid.
+          retireContract();
+        }
+      }
+      return;
+    }
+    if (!contract_active_ || msg->status == gbplanner3_interfaces::msg::ExecutionObservation::RUNNING ||
+        msg->exploration_session_id != contract_goal_.exploration_session_id ||
+        msg->goal_id != contract_goal_.goal_id ||
+        msg->planning_attempt_id != contract_goal_.planning_attempt_id ||
+        (msg->trajectory_id != 0 && msg->trajectory_id != static_cast<uint64_t>(contract_native_trajectory_.traj_id))) return;
+    if (handoff_commit_ && msg->status == Observation::SUCCESS &&
+        msg->reason == "MEASURED_GOAL_POSE_STOP_CONFIRMED") {
+      // The predecessor can finish while the successor START ack is in flight.
+      // Keep its completion final, but retain the prepared successor transaction.
+      contract_active_ = false;
+      have_target_ = have_new_target_ = trigger_ = false;
+      changeFSMExecState(WAIT_TARGET, "HANDOFF_PREDECESSOR_FINISHED");
+      return;
+    }
+    // Cancellation events retire intent; executor alone proves physical stop.
+    retireContract();
+  }
+
+  void SCANReplanFSM::contractGoalCallback(gbplanner3_interfaces::msg::LocalGoal::ConstSharedPtr msg)
+  {
+    using Result = gbplanner3_interfaces::msg::PlanningResult;
+    const auto key = std::make_tuple(msg->exploration_session_id, msg->goal_id, msg->planning_attempt_id);
+    if (contract_seen_.count(key)) return;
+    // Fail closed when this process' replay cache fills; never evict old identities.
+    if (contract_seen_.size() >= 4096) {
+      contractResult(*msg, Result::ABORTED, "IDENTITY_CACHE_FULL_RESTART_REQUIRED"); return;
+    }
+    contract_seen_.insert(key);
+    const auto now = node_->now();
+    const auto clock_type = node_->get_clock()->get_clock_type();
+    const auto &p = msg->pose.position;
+    const auto &q = msg->pose.orientation;
+    const double qnorm = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
+    if (!msg->exploration_session_id || !msg->goal_id || !msg->planning_attempt_id ||
+        !msg->source_path_id || !std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
+        !std::isfinite(qnorm) || std::abs(qnorm-1.0)>0.01 ||
+        !std::isfinite(msg->planning_radius) || msg->planning_radius<=0 ||
+        msg->header.frame_id.empty() || msg->header.frame_id != contract_odom_header_.frame_id ||
+        !have_odom_ ||
+        (navi_mode_ == NAVI_MODE::MANUAL_TARGET && !rviz_height_ready_) ||
+        !odom_pos_.allFinite() ||
+        rclcpp::Time(msg->valid_until, clock_type) <= now) {
+      contractResult(*msg, Result::ABORTED, "INVALID_OR_STALE_INPUT"); return;
+    }
+    const bool handoff = contract_active_ && allow_goal_handoff_ && !contract_planning_only_ &&
+      !handoff_commit_ && msg->exploration_session_id == contract_goal_.exploration_session_id &&
+      msg->goal_id > contract_goal_.goal_id && msg->planning_attempt_id > contract_goal_.planning_attempt_id;
+    if (handoff_commit_ || (contract_active_ && !handoff)) {
+      contractResult(*msg, Result::ABORTED, "BUSY_NO_CONTROLLER_CANCEL_ACK"); return;
+    }
+    const auto map_stamp = planner_manager_->grid_map_->lastIntegratedCloudStampNs();
+    // Require an initialized map, without rejecting goals based on cloud age.
+    // User decision (2026-09-22): disable map freshness admission checking.
+    if (map_stamp <= 0) {
+      contractResult(*msg, Result::ABORTED, "MAP_NOT_READY"); return;
+    }
+    const bool reference_mode = navi_mode_ == NAVI_MODE::REFERENCE_PATH;
+    std::vector<Eigen::Vector3d> reference;
+    if (reference_mode) {
+      if (msg->reference_path.size() < 2 || planning_horizon_ > msg->planning_radius + 1e-6) {
+        contractResult(*msg, Result::ABORTED, "INVALID_REFERENCE_OR_LOCAL_HORIZON"); return;
+      }
+      for (const auto &wp : msg->reference_path) {
+        const Eigen::Vector3d point(wp.position.x, wp.position.y, wp.position.z);
+        const auto &orientation = wp.orientation;
+        const double norm = orientation.x*orientation.x + orientation.y*orientation.y +
+                            orientation.z*orientation.z + orientation.w*orientation.w;
+        if (!point.allFinite() || !std::isfinite(norm) || std::abs(norm-1.0) > 0.01) {
+          contractResult(*msg, Result::ABORTED, "INVALID_REFERENCE_POSE"); return;
+        }
+        if (reference.empty() || (point-reference.back()).norm() > 1e-6)
+          reference.push_back(point);
+      }
+      // All poses are already body positions in the contract frame. Do not
+      // apply the legacy initial_path callback's body-height addition.
+      if (reference.size() < 2 || (reference.front()-odom_pos_).norm() > 1.0 ||
+          (reference.back()-Eigen::Vector3d(p.x,p.y,p.z)).norm() > 1e-6) {
+        contractResult(*msg, Result::ABORTED, "REFERENCE_ENDPOINT_OR_START_MISMATCH"); return;
+      }
+    } else if (!msg->reference_path.empty()) {
+      contractResult(*msg, Result::ABORTED, "REFERENCE_REQUIRES_MODE_3"); return;
+    }
+    if (handoff) {
+      auto restore_previous = captureContractState();
+      contract_goal_ = *msg;
+    ground_goal_height_ = msg->pose.position.z;
+      contract_active_ = true;
+      contract_effective_goal_valid_ = true;
+      contract_failures_ = 0;
+      trigger_ = true;
+      init_pt_ = odom_pos_;
+      end_pt_ = Eigen::Vector3d(p.x, p.y, p.z);
+      end_vel_.setZero();
+      setStartStateFromOdomOrCurrentTraj();
+      bool success = reference_mode ? planGlobalTrajByWaypoints(reference) :
+        planner_manager_->planGlobalTraj(start_pt_, start_vel_, start_acc_, end_pt_,
+                                        Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+      if (success && !reference_mode) success = adjustGlobalTargetIfOccupied();
+      if (success) {
+        have_target_ = true;
+        have_new_target_ = true;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+          success = callReboundReplan(true, attempt != 0);
+          if (success) break;
+        }
+      }
+      if (success) {
+        exec_state_ = EXEC_TRAJ;
+        replan_fail_count_ = 0;
+        flag_escape_emergency_ = true;
+        handoff_goal_ = *msg;
+        handoff_trajectory_id_ = contract_native_trajectory_.traj_id;
+        handoff_commit_ = captureContractState();
+      } else {
+        contractResult(*msg, Result::NO_PATH, "HANDOFF_PREPARE_FAILED_KEEP_PREVIOUS");
+      }
+      restore_previous();
+      RCLCPP_INFO(node_->get_logger(), "SCAN_HANDOFF_PREPARED goal=%llu ready=%d previous_goal=%llu",
+        static_cast<unsigned long long>(msg->goal_id), success,
+        static_cast<unsigned long long>(contract_goal_.goal_id));
+      return;
+    }
+    contract_goal_ = *msg;
+    ground_goal_height_ = msg->pose.position.z;
+    contract_effective_goal_valid_ = false;
+    contract_active_ = true;
+    contract_failures_ = 0;
+    if (reference_mode) {
+      trigger_ = true;
+      init_pt_ = odom_pos_;
+      contract_effective_goal_valid_ = true;
+      if (!planGlobalTrajByWaypoints(reference)) {
+        contractResult(*msg, Result::NO_PATH, "SCAN_REFERENCE_PLAN_FAILED");
+        retireContract();
+        return;
+      }
+      changeFSMExecState(GEN_NEW_TRAJ, "CONTRACT_REFERENCE");
+      RCLCPP_INFO(node_->get_logger(), "Contract reference accepted: %zu points, local horizon %.2f m",
+                  reference.size(), planning_horizon_);
+      return;
+    }
+    auto path = std::make_shared<nav_msgs::msg::Path>();
+    path->header = msg->header;
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header = msg->header;
+    pose.pose = msg->pose;
+    path->poses.push_back(pose);
+    waypointCallback(path);
   }
 
   void SCANReplanFSM::planGlobalTrajbyGivenWps()
@@ -160,6 +467,15 @@ namespace scan_planner
       return;
     }
 
+    const auto &q = msg->pose.orientation;
+    const double norm = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
+    if (msg->header.frame_id != contract_odom_header_.frame_id ||
+        !std::isfinite(norm) || std::abs(norm - 1.0) > 0.01 ||
+        !std::isfinite(msg->pose.position.x) || !std::isfinite(msg->pose.position.y)) {
+      RCLCPP_WARN(node_->get_logger(), "Ignore RViz goal with invalid frame/pose");
+      return;
+    }
+
     auto path = std::make_shared<nav_msgs::msg::Path>();
     path->header = msg->header;
     path->poses.push_back(*msg);
@@ -175,7 +491,7 @@ namespace scan_planner
       return;
     }
 
-    if (msg->poses[0].pose.position.z < -0.1)
+    if (!contract_active_ && msg->poses[0].pose.position.z < -0.1)
       return;
 
     cout << "Triggered!" << endl;
@@ -183,7 +499,9 @@ namespace scan_planner
     init_pt_ = odom_pos_;
 
     bool success = false;
-    end_pt_ << msg->poses[0].pose.position.x, msg->poses[0].pose.position.y, rviz_goal_height_;
+    end_pt_ << msg->poses[0].pose.position.x, msg->poses[0].pose.position.y,
+        contract_active_ ? msg->poses[0].pose.position.z : rviz_goal_height_;
+    if (contract_active_) contract_effective_goal_valid_ = true;
     success = planner_manager_->planGlobalTraj(odom_pos_, odom_vel_, Eigen::Vector3d::Zero(), end_pt_, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
 
     if (success)
@@ -203,6 +521,11 @@ namespace scan_planner
         gloabl_traj[i] = planner_manager_->global_data_.global_traj_.evaluate(i * step_size_t);
       }
 
+      if (!contract_mode_ && navi_mode_ == NAVI_MODE::MANUAL_TARGET) {
+        manual_view_goal_ = msg->poses[0];
+        manual_view_goal_.header = msg->header;
+        manual_view_goal_valid_ = true;
+      }
       end_vel_.setZero();
       have_target_ = true;
       have_new_target_ = true;
@@ -219,6 +542,12 @@ namespace scan_planner
     else
     {
       RCLCPP_ERROR(node_->get_logger(), "Unable to generate global trajectory");
+      if (contract_active_) {
+        contractResult(contract_goal_, gbplanner3_interfaces::msg::PlanningResult::NO_PATH, "SCAN_GLOBAL_PLAN_FAILED");
+        contract_active_ = false;
+        have_target_ = false;
+        changeFSMExecState(WAIT_TARGET, "CONTRACT");
+      }
     }
   }
 
@@ -708,6 +1037,11 @@ namespace scan_planner
 
   void SCANReplanFSM::odometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &msg)
   {
+    if (ground_height_follow_ && msg->header.frame_id == self_inflation_frame_id_) {
+      ground_height_.add(rclcpp::Time(msg->header.stamp).seconds(),
+                        msg->pose.pose.position.z, node_->now().seconds());
+    }
+    contract_odom_header_ = msg->header;
     odom_pos_(0) = msg->pose.pose.position.x;
     odom_pos_(1) = msg->pose.pose.position.y;
     odom_pos_(2) = msg->pose.pose.position.z;
@@ -859,6 +1193,26 @@ namespace scan_planner
 
   void SCANReplanFSM::execFSMCallback()
   {
+    scan_diagnostics::CallbackTiming timing(node_, "fsm");
+    // The old controller keeps moving while the candidate START is acknowledged.
+    // Collision checking remains active against the still executing old trajectory.
+    if (handoff_commit_) {
+      const auto now = node_->now();
+      const auto clock = node_->get_clock()->get_clock_type();
+      if (now >= rclcpp::Time(handoff_goal_.valid_until, clock) ||
+          (contract_active_ && now >= rclcpp::Time(contract_goal_.valid_until, clock))) {
+        discardHandoff("HANDOFF_LEASE_EXPIRED_STOP_REQUIRED");
+        retireContract();
+      }
+      return;
+    }
+    if (contract_active_ && node_->now() >= rclcpp::Time(contract_goal_.valid_until, node_->get_clock()->get_clock_type())) {
+      contractResult(contract_goal_, gbplanner3_interfaces::msg::PlanningResult::TIMEOUT, "PLANNING_LEASE_EXPIRED");
+      contract_active_ = false;
+      have_target_ = false;
+      changeFSMExecState(WAIT_TARGET, "CONTRACT");
+    }
+
     updateLocalTrajTimeFreeze();
 
     if (isExplorationMode() && have_target_ && !exploration_fixed_home_ &&
@@ -933,6 +1287,30 @@ namespace scan_planner
         flag_random_poly_init = true;
 
       bool success = callReboundReplan(true, flag_random_poly_init);
+      if (contract_mode_ && contract_active_) {
+        if (node_->now() >= rclcpp::Time(contract_goal_.valid_until, node_->get_clock()->get_clock_type())) {
+          contractResult(contract_goal_, gbplanner3_interfaces::msg::PlanningResult::TIMEOUT, "PLANNING_LEASE_EXPIRED_DURING_PLAN");
+        } else if (success && !contract_planning_only_) {
+          contract_failures_ = 0;
+          replan_fail_count_ = 0;
+          changeFSMExecState(EXEC_TRAJ, "CONTRACT_LIVE");
+          flag_escape_emergency_ = true;
+          break;
+        } else if (success) {
+          contractResult(contract_goal_, gbplanner3_interfaces::msg::PlanningResult::READY,
+            "PLANNED_NOT_EXECUTED;terminal_yaw_handled_by_executor;native_traj_id=" + std::to_string(planner_manager_->local_data_.traj_id_),
+            static_cast<uint64_t>(planner_manager_->local_data_.traj_id_));
+        } else if (++contract_failures_ < 3) {
+          break;
+        } else {
+          contractResult(contract_goal_, gbplanner3_interfaces::msg::PlanningResult::NO_PATH, "SCAN_REBOUND_FAILED_3_TRIES");
+        }
+        contract_active_ = false;
+        have_target_ = false;
+        have_new_target_ = false;
+        changeFSMExecState(WAIT_TARGET, "CONTRACT_PLANNING_ONLY");
+        break;
+      }
       if (success)
       {
 
@@ -968,6 +1346,12 @@ namespace scan_planner
       }
       else
       {
+        if (contract_mode_ && contract_active_) {
+          contractResult(contract_goal_, gbplanner3_interfaces::msg::PlanningResult::BLOCKED,
+              "SCAN_LIVE_REPLAN_FAILED");
+          retireContract();
+          break;
+        }
         exploration_preserve_on_replan_failure_ = false;
         replan_fail_count_++;
         visualization_->clearOptimalTraj(0);
@@ -987,6 +1371,18 @@ namespace scan_planner
       t_cur = min(info->duration_, t_cur);
 
       Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t_cur);
+
+      // A controller turn/terminal-yaw hold freezes execution progress. Keep
+      // the native collision timer active, but do not periodically replace
+      // the very trajectory whose endpoint orientation is being completed.
+      if (contract_mode_ && contract_active_ && go2_execution_frozen_) {
+        const Eigen::Vector3d local_end = info->position_traj_.evaluateDeBoorT(info->duration_);
+        if ((odom_pos_-local_end).norm() <= reference_segment_reached_tolerance_ &&
+            (local_end-end_pt_).norm() > reference_segment_reached_tolerance_) {
+          changeFSMExecState(REPLAN_TRAJ, "CONTRACT_LOCAL_ARRIVAL");
+        }
+        return;
+      }
 
       if (isExplorationMode() && shouldStartExplorationReplan(
               exploration_early_replan_requested_, go2_execution_frozen_))
@@ -1015,6 +1411,14 @@ namespace scan_planner
       /* && (end_pt_ - pos).norm() < 0.5 */
       if (t_cur > info->duration_ - 1e-2)
       {
+        if (contract_mode_ && contract_active_ && navi_mode_ == NAVI_MODE::REFERENCE_PATH &&
+            (info->position_traj_.evaluateDeBoorT(info->duration_) - end_pt_).norm() > no_replan_thresh_)
+        {
+          // A local spline ending is not completion of the full reference.
+          // Preserve the ordered global curve and advance its local target.
+          changeFSMExecState(REPLAN_TRAJ, "CONTRACT_REFERENCE_CONTINUE");
+          return;
+        }
         if (isExplorationMode())
         {
           if (exploration_fixed_home_)
@@ -1233,6 +1637,9 @@ namespace scan_planner
 
   void SCANReplanFSM::checkCollisionCallback()
   {
+    scan_diagnostics::CallbackTiming timing(node_, "collision");
+    if (contract_planning_only_) return; // No executing trajectory in offline mode.
+
     updateLocalTrajTimeFreeze();
 
     LocalTrajData *info = &planner_manager_->local_data_;
@@ -1254,6 +1661,15 @@ namespace scan_planner
       Eigen::Vector3d pos_next = info->position_traj_.evaluateDeBoorT(std::min(t + time_step, info->duration_));
       if (map->getInflateOccupancy(pos, estimateYawFromSegment(pos, pos_next)))
       {
+        if (handoff_commit_) {
+          // A START may already be accepted with its acknowledgement in flight.
+          // A real collision is an explicit stop, never a silent handoff rollback.
+          discardHandoff("HANDOFF_ACTIVE_COLLISION_STOP_REQUIRED");
+          contractResult(contract_goal_, gbplanner3_interfaces::msg::PlanningResult::BLOCKED,
+                         "HANDOFF_ACTIVE_COLLISION_STOP_REQUIRED");
+          retireContract();
+          return;
+        }
         if (planFromCurrentTraj()) // Make a chance
         {
           changeFSMExecState(EXEC_TRAJ, "SAFETY");
@@ -1261,6 +1677,12 @@ namespace scan_planner
         }
         else
         {
+          if (contract_mode_ && contract_active_) {
+            contractResult(contract_goal_, gbplanner3_interfaces::msg::PlanningResult::BLOCKED,
+                "SCAN_LIVE_COLLISION_REPLAN_FAILED");
+            retireContract();
+            return;
+          }
           if (t - t_cur < emergency_time_) // 0.8s of emergency time
           {
             RCLCPP_WARN(node_->get_logger(), "Obstacle discovered; emergency stop in %.3fs", t - t_cur);
@@ -1281,10 +1703,41 @@ namespace scan_planner
   bool SCANReplanFSM::callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj)
   {
 
-    getLocalTarget();
+    // Update the effective Z at an existing replan boundary, never by creating
+    // a new contract goal. Keep the original requested XYZ/IDs for correlation.
+    double height;
+    if (ground_height_follow_ && contract_active_ && navi_mode_ == NAVI_MODE::MANUAL_TARGET &&
+        ground_height_.updateNeeded(node_->now().seconds(), ground_goal_height_, height)) {
+      const auto previous_end = end_pt_;
+      const auto previous_global = planner_manager_->global_data_;
+      end_pt_.z() = height;
+      if (!planner_manager_->planGlobalTraj(start_pt_, start_vel_, start_acc_, end_pt_,
+            Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()) || !adjustGlobalTargetIfOccupied()) {
+        end_pt_ = previous_end;
+        planner_manager_->global_data_ = previous_global;
+        return false;
+      }
+      ground_goal_height_ = height;
+      flag_use_poly_init = true;
+      RCLCPP_INFO(node_->get_logger(), "GROUND_HEIGHT_UPDATE old=%.3f mean=%.3f effective=%.3f",
+                  previous_end.z(), height, end_pt_.z());
+    }
+    const double reference_target_time = getLocalTarget();
 
     bool plan_success =
-        planner_manager_->reboundReplan(start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_, (have_new_target_ || flag_use_poly_init), flag_randomPolyTraj);
+        planner_manager_->reboundReplan(start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_, (have_new_target_ || flag_use_poly_init), flag_randomPolyTraj, reference_target_time);
+    if (!plan_success) {
+      RCLCPP_WARN(node_->get_logger(),
+          "SCAN_REPLAN_CONTEXT session=%llu goal=%llu attempt=%llu state=%d poly_init=%d random=%d plan_distance=%.6f odom_local_distance=%.6f odom_goal_distance=%.6f no_replan_threshold=%.6f start=[%.6f,%.6f,%.6f] odom=[%.6f,%.6f,%.6f] local_target=[%.6f,%.6f,%.6f] start_speed=%.6f start_acc=%.6f",
+          static_cast<unsigned long long>(contract_goal_.exploration_session_id),
+          static_cast<unsigned long long>(contract_goal_.goal_id),
+          static_cast<unsigned long long>(contract_goal_.planning_attempt_id),
+          static_cast<int>(exec_state_), static_cast<int>(have_new_target_ || flag_use_poly_init),
+          static_cast<int>(flag_randomPolyTraj), (start_pt_-local_target_pt_).norm(),
+          (odom_pos_-local_target_pt_).norm(), (odom_pos_-end_pt_).norm(), no_replan_thresh_,
+          start_pt_.x(), start_pt_.y(), start_pt_.z(), odom_pos_.x(), odom_pos_.y(), odom_pos_.z(),
+          local_target_pt_.x(), local_target_pt_.y(), local_target_pt_.z(), start_vel_.norm(), start_acc_.norm());
+    }
     have_new_target_ = false;
 
     cout << "final_plan_success=" << plan_success << endl;
@@ -1318,12 +1771,53 @@ namespace scan_planner
         bspline.knots.push_back(knots(i));
       }
 
+      if (contract_active_ && !contract_planning_only_ &&
+          node_->now() >= rclcpp::Time(contract_goal_.valid_until, node_->get_clock()->get_clock_type()))
+        return false; // Never publish a spline whose lease expired during optimization.
+      if (contract_active_) {
+        contract_native_trajectory_ = bspline;
+        if (!contract_planning_only_) {
+          contractResult(contract_goal_, gbplanner3_interfaces::msg::PlanningResult::READY,
+              "LIVE_NATIVE_TRAJECTORY", static_cast<uint64_t>(info->traj_id_));
+        }
+      }
       bspline_pub_->publish(bspline);
+      publishGoalTrajectory(bspline);
 
       visualization_->displayOptimalTraj(info->position_traj_, 0);
     }
 
     return plan_success;
+  }
+
+  void SCANReplanFSM::publishGoalTrajectory(
+      const scan_planner_msgs::msg::Bspline &trajectory, bool emergency)
+  {
+    if (contract_mode_) return;
+    gbplanner3_interfaces::msg::ScanTrajectory out;
+    out.trajectory = trajectory;
+    out.result.header = contract_odom_header_;
+    out.result.header.stamp = node_->now();
+    out.result.trajectory_id = trajectory.traj_id;
+    out.result.trajectory_start_time = trajectory.start_time;
+    out.result.status = emergency ? gbplanner3_interfaces::msg::PlanningResult::ABORTED
+                                  : gbplanner3_interfaces::msg::PlanningResult::READY;
+    out.result.reason = emergency ? "NATIVE_EMERGENCY_STOP" : "MANUAL_GOAL_TRAJECTORY";
+    if (!emergency && manual_view_goal_valid_ && navi_mode_ == NAVI_MODE::MANUAL_TARGET) {
+      out.result.requested_goal = manual_view_goal_.pose;
+      out.result.effective_goal = manual_view_goal_.pose;
+      out.result.effective_goal.position.x = end_pt_.x();
+      out.result.effective_goal.position.y = end_pt_.y();
+      out.result.effective_goal.position.z = end_pt_.z();
+      out.result.effective_goal_valid = true;
+      out.result.goal_adjusted = goalPositionAdjusted(out.result.requested_goal, out.result.effective_goal);
+    }
+    const auto &info = planner_manager_->local_data_;
+    const auto endpoint = info.position_traj_.evaluateDeBoorT(info.duration_);
+    out.result.trajectory_end.x = endpoint.x();
+    out.result.trajectory_end.y = endpoint.y();
+    out.result.trajectory_end.z = endpoint.z();
+    goal_trajectory_pub_->publish(out);
   }
 
   bool SCANReplanFSM::callEmergencyStop(Eigen::Vector3d stop_pos)
@@ -1358,6 +1852,7 @@ namespace scan_planner
     }
 
     bspline_pub_->publish(bspline);
+    publishGoalTrajectory(bspline, true);
 
     return true;
   }
@@ -1383,7 +1878,7 @@ namespace scan_planner
     visualization_->displayGlobalPathList(remaining_path, 0.1, 0);
   }
 
-  void SCANReplanFSM::getLocalTarget()
+  double SCANReplanFSM::getLocalTarget()
   {
     double t;
 
@@ -1430,6 +1925,15 @@ namespace scan_planner
       return planner_manager_->grid_map_->getInflateOccupancy(pt, estimateYawFromSegment(odom_pos_, pt));
     };
 
+    auto admissibleAdjustment = [&](const Eigen::Vector3d &pt) {
+      // A free start point is not a usable replacement for a blocked target.
+      // Reference-mode adjustment must also stay inside the local horizon.
+      return pt.allFinite() &&
+          (navi_mode_ != NAVI_MODE::REFERENCE_PATH ||
+           referenceTargetInRange((pt-start_pt_).norm(), planning_horizon_, 0.1)) &&
+          targetOccupancy(pt) == 0;
+    };
+
     if (targetOccupancy(local_target_pt_) != 0)
     {
       bool found_free_target = false;
@@ -1441,7 +1945,7 @@ namespace scan_planner
         if (t_forward <= planner_manager_->global_data_.global_duration_)
         {
           Eigen::Vector3d pt = planner_manager_->global_data_.getPosition(t_forward);
-          if (targetOccupancy(pt) == 0)
+          if (admissibleAdjustment(pt))
           {
             local_target_pt_ = pt;
             adjusted_t = t_forward;
@@ -1454,7 +1958,7 @@ namespace scan_planner
         if (t_backward >= std::max(0.0, dist_min_t))
         {
           Eigen::Vector3d pt = planner_manager_->global_data_.getPosition(t_backward);
-          if (targetOccupancy(pt) == 0)
+          if (admissibleAdjustment(pt))
           {
             local_target_pt_ = pt;
             adjusted_t = t_backward;
@@ -1496,6 +2000,7 @@ namespace scan_planner
     }
 
     displayRemainingGlobalPath();
+    return target_t;  // Preserve the selected branch/time after collision adjustment.
   }
 
 } // namespace scan_planner

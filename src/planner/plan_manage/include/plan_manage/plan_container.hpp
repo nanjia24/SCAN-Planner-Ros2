@@ -4,6 +4,8 @@
 #include <Eigen/Eigen>
 #include <vector>
 #include <rclcpp/rclcpp.hpp>
+#include <algorithm>
+#include <cmath>
 
 #include <bspline_opt/uniform_bspline.h>
 #include <traj_utils/polynomial_traj.h>
@@ -114,6 +116,54 @@ namespace scan_planner
         local_traj_[0].getTimeSpan(tm, tmp);
         return local_traj_[2].evaluateDeBoor(tm + t - local_start_time_);
       }
+    }
+
+    // Sample the exact selected reference interval. Time, rather than endpoint
+    // proximity, disambiguates loops and repeated positions in ordered paths.
+    bool getTrajBetweenTimes(double start_t, double end_t, double dist_pt,
+                             vector<Eigen::Vector3d> &points,
+                             vector<Eigen::Vector3d> &derivatives, double &dt)
+    {
+      points.clear();
+      derivatives.clear();
+      dt = 0.0;
+      if (!std::isfinite(start_t) || !std::isfinite(end_t) ||
+          !std::isfinite(dist_pt) || dist_pt <= 0.0 ||
+          start_t < 0.0 || end_t > global_duration_ || end_t - start_t <= 1e-4)
+        return false;
+
+      const double duration = end_t - start_t;
+      const int probes = std::max(1, static_cast<int>(std::ceil(duration / 0.2)));
+      double length = 0.0;
+      Eigen::Vector3d previous = getPosition(start_t);
+      for (int i = 1; i <= probes; ++i)
+      {
+        const auto p = getPosition(i == probes ? end_t : start_t + duration * i / probes);
+        length += (p - previous).norm();
+        previous = p;
+      }
+      if (!std::isfinite(length) || length <= 1e-6)
+        return false;
+
+      const int segments = std::max(6, static_cast<int>(std::ceil(length / dist_pt)));
+      vector<Eigen::Vector3d> samples;
+      samples.reserve(segments + 1);
+      for (int i = 0; i <= segments; ++i)
+      {
+        const auto p = getPosition(i == segments ? end_t : start_t + duration * i / segments);
+        if (!p.allFinite())
+          return false;
+        samples.push_back(p);
+      }
+      vector<Eigen::Vector3d> bounds{getVelocity(start_t), getVelocity(end_t),
+                                    getAcceleration(start_t), getAcceleration(end_t)};
+      for (const auto &v : bounds)
+        if (!v.allFinite())
+          return false;
+      points.swap(samples);
+      derivatives.swap(bounds);
+      dt = duration / segments;
+      return true;
     }
 
     // get Bspline parameterization data of a local trajectory within a sphere

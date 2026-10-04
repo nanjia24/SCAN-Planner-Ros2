@@ -1,6 +1,8 @@
 #include "plan_env/grid_map.h"
+#include "plan_env/callback_timing.h"
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 
@@ -63,6 +65,7 @@ void GridMap::initMap(rclcpp::Node *node)
 
   load_parameter(node_, "grid_map.sensor_type", mp_.sensor_type_, string("lidar"));
   load_parameter(node_, "grid_map.cloud_is_world", mp_.cloud_is_world_, true);
+  load_parameter(node_, "grid_map.integrate_cloud_on_receipt", integrate_cloud_on_receipt_, false);
   load_parameter(node_, "grid_map.need_extrinsic", mp_.need_extrinsic_, true);
 
   mp_.lidar_extrinsic_ <<
@@ -151,9 +154,34 @@ void GridMap::initMap(rclcpp::Node *node)
     lidar_pose_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
         "sensor_pose", rclcpp::SensorDataQoS(),
         std::bind(&GridMap::sensorPoseCallback, this, std::placeholders::_1));
+    load_parameter(node_, "grid_map.use_segmented_cloud", use_segmented_cloud_, false);
+    load_parameter(node_, "grid_map.segmented_cloud_frame", segmented_cloud_frame_, std::string("lidar"));
+    // The two segmented outputs share a source stamp, but are delivered on
+    // separate topics. Retransmission and a short backlog protect the pair.
+    const bool default_reliable = use_segmented_cloud_;
+    bool cloud_qos_reliable = default_reliable;
+    load_parameter(node_, "grid_map.cloud_qos_reliable", cloud_qos_reliable, default_reliable);
+    const int default_queue_depth = use_segmented_cloud_ ? 12 : 5;
+    int cloud_queue_depth = default_queue_depth;
+    load_parameter(node_, "grid_map.cloud_queue_depth", cloud_queue_depth, default_queue_depth);
+    if (cloud_queue_depth < 1 || cloud_queue_depth > 100)
+      throw std::invalid_argument("grid_map.cloud_queue_depth must be in [1,100]");
+    auto cloud_qos = rclcpp::SensorDataQoS();
+    cloud_qos.keep_last(static_cast<size_t>(cloud_queue_depth));
+    if (cloud_qos_reliable)
+      cloud_qos.reliable();
+    pair_queue_depth_ = static_cast<size_t>(cloud_queue_depth);
     cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
-        "cloud", rclcpp::SensorDataQoS(),
-        std::bind(&GridMap::cloudCallback, this, std::placeholders::_1));
+        "cloud", cloud_qos, [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud) {
+          if (use_segmented_cloud_) segmentedCloudCallback(cloud, false);
+          else cloudCallback(cloud);
+        });
+    if (use_segmented_cloud_)
+      ground_cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+          "ground_cloud", cloud_qos,
+          [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud) {
+            segmentedCloudCallback(cloud, true);
+          });
   }
 
   sliding_map_frame_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
@@ -165,6 +193,8 @@ void GridMap::initMap(rclcpp::Node *node)
   vis_timer_ = node_->create_wall_timer(std::chrono::milliseconds(50),
                                         std::bind(&GridMap::visCallback, this));
 
+  integrated_cloud_pub_ = node_->create_publisher<std_msgs::msg::Header>(
+      "planning/integrated_cloud", rclcpp::QoS(10).reliable());
   map_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/occupancy", rclcpp::SensorDataQoS());
   map_inf_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/occupancy_inflate", rclcpp::SensorDataQoS());
   sliding_map_bbox_pub_ = node_->create_publisher<visualization_msgs::msg::Marker>("grid_map/sliding_map_bbox", 10);
@@ -473,6 +503,8 @@ int GridMap::setCacheOccupancy(Eigen::Vector3d pos, int occ)
 
 void GridMap::projectDepthImage()
 {
+  segmented_batch_ = false;
+  projected_hits_.clear();
   // md_.proj_points_.clear();
   md_.proj_points_cnt = 0;
 
@@ -545,7 +577,10 @@ void GridMap::raycastProcess()
   if (md_.proj_points_cnt == 0)
     return;
 
-  updateSlidingMap(md_.ray_pos_);
+  // The current odometry owns the window in segmented mode. Raycasts may use
+  // an older interpolated pose when a matching cloud pair arrives late.
+  if (!segmented_batch_)
+    updateSlidingMap(md_.ray_pos_);
 
   md_.raycast_num_ += 1;
 
@@ -569,6 +604,11 @@ void GridMap::raycastProcess()
   {
     pt_w = md_.proj_points_[i];
 
+    const bool ground_ray = segmented_batch_ && !projected_hits_[i];
+    Eigen::Vector3i ground_endpoint;
+    posToIndex(pt_w, ground_endpoint);
+    // Ground endpoints provide clearing only before their cell. Never clear
+    // their surface cell: a coarse cell can also contain a thin obstacle.
     // set flag for projected point
 
     if (!isInMap(pt_w))
@@ -593,7 +633,7 @@ void GridMap::raycastProcess()
       }
       else
       {
-        vox_idx = setCacheOccupancy(pt_w, 1);
+        vox_idx = ground_ray ? INVALID_IDX : setCacheOccupancy(pt_w, 1);
       }
     }
 
@@ -626,6 +666,11 @@ void GridMap::raycastProcess()
       Eigen::Vector3d tmp = (ray_pt + half) * mp_.resolution_;
       length = (tmp - md_.ray_pos_).norm();
 
+      if (ground_ray) {
+        Eigen::Vector3i id;
+        posToIndex(tmp, id);
+        if (id == ground_endpoint) continue;
+      }
       vox_idx = setCacheOccupancy(tmp, 0);
 
       if (vox_idx != INVALID_IDX)
@@ -676,7 +721,9 @@ void GridMap::raycastProcess()
     md_.cache_voxel_.pop();
 
     double log_odds_update =
-        md_.count_hit_[idx_ctns] >= md_.count_hit_and_miss_[idx_ctns] - md_.count_hit_[idx_ctns] ? mp_.prob_hit_log_ : mp_.prob_miss_log_;
+        ((segmented_batch_ && md_.count_hit_[idx_ctns] > 0) ||
+         md_.count_hit_[idx_ctns] >= md_.count_hit_and_miss_[idx_ctns] - md_.count_hit_[idx_ctns])
+            ? mp_.prob_hit_log_ : mp_.prob_miss_log_;
 
     md_.count_hit_[idx_ctns] = md_.count_hit_and_miss_[idx_ctns] = 0;
 
@@ -732,6 +779,7 @@ Eigen::Vector3d GridMap::closetPointInMap(const Eigen::Vector3d &pt, const Eigen
 
 void GridMap::visCallback()
 {
+  scan_diagnostics::CallbackTiming timing(node_, "visualization");
 
   publishMap();
   publishMapInflate(true);
@@ -752,7 +800,18 @@ void GridMap::updateOccupancyCallback()
   if (!md_.use_cloud_update_)
     projectDepthImage();
   // t2 = ros::Time::now();
+  scan_diagnostics::CallbackTiming timing(node_, "integration", pending_cloud_stamp_ns_);
   raycastProcess();
+  if (md_.use_cloud_update_ && md_.proj_points_cnt > 0)
+  {
+    integrated_cloud_stamp_ns_ = pending_cloud_stamp_ns_;
+    std_msgs::msg::Header integrated;
+    integrated.stamp = rclcpp::Time(integrated_cloud_stamp_ns_);
+    integrated.frame_id = mp_.frame_id_;
+    integrated_cloud_pub_->publish(integrated);
+    RCLCPP_DEBUG(node_->get_logger(), "SCAN_CLOUD_INTEGRATED stamp_ns=%lld",
+                 static_cast<long long>(integrated_cloud_stamp_ns_));
+  }
   // t3 = ros::Time::now();
 
   // t4 = ros::Time::now();
@@ -861,6 +920,14 @@ void GridMap::sensorPoseCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &
   md_.ray_q_ = ray_q;
   md_.has_ray_pose_ = true;
   updateSlidingMap(md_.ray_pos_);
+  if (use_segmented_cloud_) {
+    const int64_t stamp = rclcpp::Time(pose_msg->header.stamp).nanoseconds();
+    if (stamp > 0) sensor_poses_[stamp] = SensorPose{ray_pos, ray_q};
+    while (!sensor_poses_.empty() &&
+           (sensor_poses_.size() > 1000 || sensor_poses_.begin()->first < stamp - 3000000000LL))
+      sensor_poses_.erase(sensor_poses_.begin());
+    consumeCloudPairs();
+  }
 }
 
 void GridMap::slidingMapFrameCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &pose)
@@ -869,8 +936,107 @@ void GridMap::slidingMapFrameCallback(const nav_msgs::msg::Odometry::ConstShared
   md_.sliding_map_frame_pos_ = Eigen::Vector3d(pos.x, pos.y, pos.z);
 }
 
+void GridMap::segmentedCloudCallback(sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud, bool ground)
+{
+  const int64_t stamp = rclcpp::Time(cloud->header.stamp).nanoseconds();
+  if (stamp <= 0 || cloud->header.frame_id.empty()) {
+    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+                        "SCAN_SEGMENTED_PAIR_INVALID_HEADER");
+    return;
+  }
+  auto &pair = cloud_pairs_[stamp];
+  (ground ? pair.ground : pair.obstacle) = cloud;
+  consumeCloudPairs();
+  while (cloud_pairs_.size() > pair_queue_depth_) {
+    // Keep complete pairs waiting for a future odometry bracket when an
+    // incomplete frame can be evicted instead.
+    auto oldest = cloud_pairs_.begin();
+    for (auto it = cloud_pairs_.begin(); it != cloud_pairs_.end(); ++it) {
+      if (!it->second.ground || !it->second.obstacle) {
+        oldest = it;
+        break;
+      }
+    }
+    if (!oldest->second.ground) {
+      RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+                          "SCAN_SEGMENTED_FRAME_DROPPED missing=ground stamp_ns=%lld",
+                          static_cast<long long>(oldest->first));
+    } else if (!oldest->second.obstacle) {
+      RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+                          "SCAN_SEGMENTED_FRAME_DROPPED missing=nonground stamp_ns=%lld",
+                          static_cast<long long>(oldest->first));
+    } else {
+      RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+                          "SCAN_SEGMENTED_FRAME_DROPPED pose_bracket_pending stamp_ns=%lld",
+                          static_cast<long long>(oldest->first));
+    }
+    cloud_pairs_.erase(oldest);
+  }
+}
+
+bool GridMap::setSegmentedPose(int64_t stamp)
+{
+  auto next = sensor_poses_.lower_bound(stamp);
+  if (next == sensor_poses_.end()) return false;
+  if (next->first == stamp) {
+    md_.ray_pos_ = next->second.position;
+    md_.ray_q_ = next->second.orientation;
+    return true;
+  }
+  if (next == sensor_poses_.begin()) return false;
+  const auto prev = std::prev(next);
+  const double t = static_cast<double>(stamp - prev->first) / (next->first - prev->first);
+  md_.ray_pos_ = (1.0 - t) * prev->second.position + t * next->second.position;
+  md_.ray_q_ = prev->second.orientation.slerp(t, next->second.orientation);
+  return true;
+}
+
+void GridMap::consumeCloudPairs()
+{
+  for (auto it = cloud_pairs_.begin(); it != cloud_pairs_.end();) {
+    const auto &pair = it->second;
+    if (!pair.ground || !pair.obstacle) { ++it; continue; }
+    if (pair.ground->header.frame_id != pair.obstacle->header.frame_id ||
+        (!segmented_cloud_frame_.empty() && pair.obstacle->header.frame_id != segmented_cloud_frame_)) {
+      RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+                          "SCAN_SEGMENTED_PAIR_FRAME_MISMATCH");
+      it = cloud_pairs_.erase(it);
+      continue;
+    }
+    if (!setSegmentedPose(it->first)) {
+      if (!sensor_poses_.empty() && it->first < sensor_poses_.begin()->first) {
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+                            "SCAN_SEGMENTED_FRAME_DROPPED pose_too_old stamp_ns=%lld oldest_pose_ns=%lld",
+                            static_cast<long long>(it->first),
+                            static_cast<long long>(sensor_poses_.begin()->first));
+        it = cloud_pairs_.erase(it);
+      } else {
+        // A later odometry sample can still bracket this timestamp.
+        ++it;
+      }
+      continue;
+    }
+    auto complete = pair;
+    it = cloud_pairs_.erase(it);
+    const Eigen::Vector3d latest_pos = sensor_poses_.rbegin()->second.position;
+    const Eigen::Quaterniond latest_q = sensor_poses_.rbegin()->second.orientation;
+    integrateCloudPair(complete.obstacle, complete.ground);
+    md_.ray_pos_ = latest_pos;
+    md_.ray_q_ = latest_q;
+  }
+}
+
 void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &img)
 {
+  integrateCloudPair(img, nullptr);
+}
+
+void GridMap::integrateCloudPair(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &img,
+                               const sensor_msgs::msg::PointCloud2::ConstSharedPtr &ground)
+{
+  scan_diagnostics::CallbackTiming timing(node_, "cloud", rclcpp::Time(img->header.stamp).nanoseconds());
+  RCLCPP_DEBUG(node_->get_logger(), "SCAN_CLOUD_RECEIVED stamp_ns=%lld",
+               static_cast<long long>(rclcpp::Time(img->header.stamp).nanoseconds()));
   if (mp_.sensor_type_ != "lidar")
     return;
 
@@ -883,6 +1049,12 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
 
   pcl::PointCloud<pcl::PointXYZ> latest_cloud;
   pcl::fromROSMsg(*img, latest_cloud);
+  const size_t obstacle_count = latest_cloud.size();
+  if (ground) {
+    pcl::PointCloud<pcl::PointXYZ> ground_points;
+    pcl::fromROSMsg(*ground, ground_points);
+    latest_cloud += ground_points;
+  }
 
   md_.has_cloud_ = true;
 
@@ -894,9 +1066,12 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
   if (!std::isfinite(ray_pos.x()) || !std::isfinite(ray_pos.y()) || !std::isfinite(ray_pos.z()))
     return;
 
-  updateSlidingMap(ray_pos);
+  if (!ground)
+    updateSlidingMap(ray_pos);
 
   md_.proj_points_cnt = 0;
+  segmented_batch_ = static_cast<bool>(ground);
+  projected_hits_.clear();
 
   for (size_t i = 0; i < latest_cloud.points.size(); ++i)
   {
@@ -927,14 +1102,23 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     else
       md_.proj_points_[md_.proj_points_cnt] = pt_world;
 
+    projected_hits_.push_back(i < obstacle_count);
     md_.proj_points_cnt++;
   }
 
   if (md_.proj_points_cnt == 0)
     return;
 
+  pending_cloud_stamp_ns_ = rclcpp::Time(img->header.stamp).nanoseconds();
+  RCLCPP_DEBUG(node_->get_logger(), "SCAN_CLOUD_ACCEPTED stamp_ns=%lld",
+               static_cast<long long>(pending_cloud_stamp_ns_));
   md_.use_cloud_update_ = true;
   md_.occ_need_update_ = true;
+  // Opt-in recorded-data scheduling: consume this valid cloud before the next
+  // callback can overwrite the single pending buffer. The timer sees no pending
+  // update afterward; raycasting and occupancy policies remain unchanged.
+  if (integrate_cloud_on_receipt_ || segmented_batch_)
+    updateOccupancyCallback();
 }
 
 void GridMap::publishMap()

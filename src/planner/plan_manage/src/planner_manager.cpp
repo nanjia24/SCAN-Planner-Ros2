@@ -1,6 +1,7 @@
 // #include <fstream>
 #include <plan_manage/planner_manager.h>
-#include <plan_manage/dynamic_feasibility.hpp>
+#include <plan_manage/polynomial_initial_time.h>
+#include <plan_manage/reference_path_utils.h>
 #include <chrono>
 #include <thread>
 
@@ -87,7 +88,7 @@ namespace scan_planner
 
   bool SCANPlannerManager::reboundReplan(Eigen::Vector3d start_pt, Eigen::Vector3d start_vel,
                                         Eigen::Vector3d start_acc, Eigen::Vector3d local_target_pt,
-                                        Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj)
+                                        Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj, double reference_target_time)
   {
 
     static int count = 0;
@@ -97,9 +98,12 @@ namespace scan_planner
     cout << "start: " << start_pt.transpose() << ", " << start_vel.transpose() << "\ngoal:" << local_target_pt.transpose() << ", " << local_target_vel.transpose()
          << endl;
 
-    if ((start_pt - local_target_pt).norm() < 0.2)
+    if ((start_pt - local_target_pt).norm() < 0.1)
     {
-      cout << "Close to goal" << endl;
+      RCLCPP_WARN(node_->get_logger(),
+          "SCAN_REPLAN_REJECT reason=TARGET_TOO_CLOSE distance=%.6f threshold=0.100000 start=[%.6f,%.6f,%.6f] target=[%.6f,%.6f,%.6f]",
+          (start_pt-local_target_pt).norm(), start_pt.x(), start_pt.y(), start_pt.z(),
+          local_target_pt.x(), local_target_pt.y(), local_target_pt.z());
       continuous_failures_count_++;
       return false;
     }
@@ -126,17 +130,16 @@ namespace scan_planner
           global_data_.global_duration_ > 1e-3 &&
           (start_pt - local_target_pt).norm() >= pp_.ctrl_pt_dist * 6.0)
       {
-        double reference_duration = 0.0;
-        global_data_.getTrajByRadius(
-            reference_start_t,
-            pp_.planning_horizon_,
-            pp_.ctrl_pt_dist,
-            point_set,
-            start_end_derivatives,
-            ts,
-            reference_duration);
+        // The local target may have moved back from the horizon at a map edge
+        // or obstacle. Sample only up to its selected global time, including all
+        // intermediate points; replacing just the last radius sample folds the
+        // seed back onto itself and can trigger random-detour fallback.
+        const double reference_duration = reference_target_time - reference_start_t;
+        const bool sampled = global_data_.getTrajBetweenTimes(
+            reference_start_t, reference_target_time, pp_.ctrl_pt_dist,
+            point_set, start_end_derivatives, ts);
 
-        if (point_set.size() >= 7 && start_end_derivatives.size() == 4 && ts > 1e-4)
+        if (sampled && point_set.size() >= 7 && start_end_derivatives.size() == 4 && ts > 1e-4)
         {
           point_set.front() = start_pt;
           point_set.back() = local_target_pt;
@@ -148,15 +151,15 @@ namespace scan_planner
           flag_first_call = false;
           flag_force_polynomial = false;
           RCLCPP_INFO(node_->get_logger(),
-                      "Initialized local trajectory from global reference path: %zu points, %.2f s",
-                      point_set.size(), reference_duration);
+                      "Initialized local trajectory from global reference path: %zu points, %.2f s, interval=[%.3f,%.3f]",
+                      point_set.size(), reference_duration, reference_start_t, reference_target_time);
         }
         else
         {
           point_set.clear();
           start_end_derivatives.clear();
           RCLCPP_WARN(node_->get_logger(),
-                      "Global reference segment is too short; falling back to polynomial initialization");
+                      "Global reference interval is invalid or too short; falling back to polynomial initialization");
         }
       }
 
@@ -173,6 +176,20 @@ namespace scan_planner
 
         if (!flag_randomPolyTraj)
         {
+          double candidate_time = time;
+          if (selectPolynomialInitialTime(start_pt, start_vel, start_acc,
+                                          local_target_pt, local_target_vel,
+                                          pp_.max_vel_, pp_.max_acc_, candidate_time))
+          {
+            time = candidate_time;
+          }
+          else
+          {
+            // Preserve native handling of already excessive boundary states;
+            // final B-spline feasibility checks still decide acceptance.
+            RCLCPP_WARN(node_->get_logger(),
+                        "Polynomial initial time unavailable for current boundary; using native initialization");
+          }
           gl_traj = PolynomialTraj::one_segment_traj_gen(start_pt, start_vel, start_acc, local_target_pt, local_target_vel, Eigen::Vector3d::Zero(), time);
         }
         else
@@ -191,32 +208,11 @@ namespace scan_planner
           gl_traj = PolynomialTraj::minSnapTraj(pos, start_vel, local_target_vel, start_acc, Eigen::Vector3d::Zero(), t);
         }
 
-        double t;
-        bool flag_too_far;
-        ts *= 1.5; // ts will be divided by 1.5 in the next
-        do
-        {
-          ts /= 1.5;
-          point_set.clear();
-          flag_too_far = false;
-          Eigen::Vector3d last_pt = gl_traj.evaluate(0);
-          for (t = 0; t < time; t += ts)
-          {
-            Eigen::Vector3d pt = gl_traj.evaluate(t);
-            if ((last_pt - pt).norm() > pp_.ctrl_pt_dist * 1.5)
-            {
-              flag_too_far = true;
-              break;
-            }
-            last_pt = pt;
-            point_set.push_back(pt);
-          }
-        } while (flag_too_far || point_set.size() < 7); // To make sure the initial path has enough points.
-        t -= ts;
+        samplePolynomialEndpoints(gl_traj, time, pp_.ctrl_pt_dist, ts, point_set);
         start_end_derivatives.push_back(gl_traj.evaluateVel(0));
         start_end_derivatives.push_back(local_target_vel);
         start_end_derivatives.push_back(gl_traj.evaluateAcc(0));
-        start_end_derivatives.push_back(gl_traj.evaluateAcc(t));
+        start_end_derivatives.push_back(gl_traj.evaluateAcc(time));
       }
       else if (!initialized_from_global_reference) // Initial path generated from previous trajectory.
       {
@@ -318,6 +314,7 @@ namespace scan_planner
     cout << "first_optimize_step_success=" << flag_step_1_success << endl;
     if (!flag_step_1_success)
     {
+      RCLCPP_WARN(node_->get_logger(), "SCAN_REPLAN_REJECT reason=REBOUND_OPTIMIZATION_FAILED");
       // visualization_->displayOptimalList( ctrl_pts, vis_id );
       continuous_failures_count_++;
       return false;
@@ -343,22 +340,10 @@ namespace scan_planner
         pos = UniformBspline(optimal_control_points, 3, ts);
     }
 
-    constexpr int max_retiming_attempts = 3;
-    const bool dynamically_feasible = flag_step_2_success && retimeUntilFeasible(
-      max_retiming_attempts,
-      [this, &pos](double * required_scale, const bool log_failure) {
-        return checkDynamicFeasibility(pos, required_scale, log_failure);
-      },
-      [this, &pos](const double applied_scale, const int attempt, const int max_attempts) {
-        RCLCPP_WARN(
-          node_->get_logger(),
-          "Retiming dynamically infeasible trajectory: attempt=%d/%d scale=%.3f",
-          attempt, max_attempts, applied_scale);
-        pos.lengthenTime(applied_scale);
-      });
-
-    if (!flag_step_2_success || !dynamically_feasible)
+    if (!flag_step_2_success || !checkDynamicFeasibility(pos))
     {
+      RCLCPP_WARN(node_->get_logger(), "SCAN_REPLAN_REJECT reason=%s",
+                  flag_step_2_success ? "DYNAMIC_FEASIBILITY_FAILED" : "REFINE_FAILED");
       printf("\033[34mThis refined trajectory is unsafe or dynamically infeasible. Skip publishing it.\n\033[0m");
       continuous_failures_count_++;
       return false;
@@ -415,64 +400,24 @@ namespace scan_planner
       return false;
     }
 
-    double total_len = 0;
-    for (size_t i = 0; i < points.size() - 1; i++)
-    {
-      total_len += (points[i + 1] - points[i]).norm();
-    }
-
-    // insert intermediate points if too far
-    vector<Eigen::Vector3d> inter_points;
-    double dist_thresh = max(total_len / 8, 4.0);
-
-    for (size_t i = 0; i < points.size() - 1; ++i)
-    {
-      inter_points.push_back(points.at(i));
-      double dist = (points.at(i + 1) - points.at(i)).norm();
-
-      if (dist > dist_thresh)
-      {
-        int id_num = floor(dist / dist_thresh) + 1;
-
-        for (int j = 1; j < id_num; ++j)
-        {
-          Eigen::Vector3d inter_pt =
-              points.at(i) * (1.0 - double(j) / id_num) + points.at(i + 1) * double(j) / id_num;
-          inter_points.push_back(inter_pt);
-        }
-      }
-    }
-
-    inter_points.push_back(points.back());
-
-    // for ( int i=0; i<inter_points.size(); i++ )
-    // {
-    //   cout << inter_points[i].transpose() << endl;
-    // }
-
-    // write position matrix
-    int pt_num = inter_points.size();
-    Eigen::MatrixXd pos(3, pt_num);
-    for (int i = 0; i < pt_num; ++i)
-      pos.col(i) = inter_points[i];
-
-    Eigen::Vector3d zero(0, 0, 0);
-    Eigen::VectorXd time(pt_num - 1);
-    for (int i = 0; i < pt_num - 1; ++i)
-    {
-      time(i) = (pos.col(i + 1) - pos.col(i)).norm() / (pp_.max_vel_);
-    }
-
-    time(0) *= 2.0;
-    time(time.rows() - 1) *= 2.0;
-
     PolynomialTraj gl_traj;
-    if (pos.cols() >= 3)
-      gl_traj = PolynomialTraj::minSnapTraj(pos, start_vel, end_vel, start_acc, end_acc, time);
-    else if (pos.cols() == 2)
-      gl_traj = PolynomialTraj::one_segment_traj_gen(start_pos, start_vel, start_acc, pos.col(1), end_vel, end_acc, time(0));
-    else
+    const char* timing_reason = nullptr;
+    if (!makePlannerGuidanceReference(points, start_vel, start_acc, end_vel, end_acc,
+                            pp_.max_vel_, pp_.max_acc_, pp_.ctrl_pt_dist,
+                            pp_.max_vel_+pp_.vel_tolerance_, pp_.max_acc_+pp_.acc_tolerance_,
+                            gl_traj, timing_reason))
+    {
+      RCLCPP_WARN(node_->get_logger(),
+          "SCAN_REFERENCE_REJECT reason=%s start_v=%.6f start_a=%.6f end_v=%.6f end_a=%.6f nominal_v=%.6f nominal_a=%.6f allowed_v=%.6f allowed_a=%.6f points=%zu",
+          timing_reason, start_vel.norm(), start_acc.norm(), end_vel.norm(), end_acc.norm(),
+          pp_.max_vel_, pp_.max_acc_, pp_.max_vel_+pp_.vel_tolerance_, pp_.max_acc_+pp_.acc_tolerance_, points.size());
       return false;
+    }
+    if (std::string(timing_reason) != "ORIGINAL_BOUNDARY") {
+      RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+          "SCAN_REFERENCE_GUIDE reason=%s start_v=%.6f start_a=%.6f; executable boundary unchanged",
+          timing_reason, start_vel.norm(), start_acc.norm());
+    }
 
     auto time_now = node_->now();
     global_data_.setGlobalTraj(gl_traj, time_now);
@@ -490,53 +435,24 @@ namespace scan_planner
     points.push_back(start_pos);
     points.push_back(end_pos);
 
-    // insert intermediate points if too far
-    vector<Eigen::Vector3d> inter_points;
-    const double dist_thresh = 4.0;
-
-    for (size_t i = 0; i < points.size() - 1; ++i)
-    {
-      inter_points.push_back(points.at(i));
-      double dist = (points.at(i + 1) - points.at(i)).norm();
-
-      if (dist > dist_thresh)
-      {
-        int id_num = floor(dist / dist_thresh) + 1;
-
-        for (int j = 1; j < id_num; ++j)
-        {
-          Eigen::Vector3d inter_pt =
-              points.at(i) * (1.0 - double(j) / id_num) + points.at(i + 1) * double(j) / id_num;
-          inter_points.push_back(inter_pt);
-        }
-      }
-    }
-
-    inter_points.push_back(points.back());
-
-    // write position matrix
-    int pt_num = inter_points.size();
-    Eigen::MatrixXd pos(3, pt_num);
-    for (int i = 0; i < pt_num; ++i)
-      pos.col(i) = inter_points[i];
-
-    Eigen::Vector3d zero(0, 0, 0);
-    Eigen::VectorXd time(pt_num - 1);
-    for (int i = 0; i < pt_num - 1; ++i)
-    {
-      time(i) = (pos.col(i + 1) - pos.col(i)).norm() / (pp_.max_vel_);
-    }
-
-    time(0) *= 2.0;
-    time(time.rows() - 1) *= 2.0;
-
     PolynomialTraj gl_traj;
-    if (pos.cols() >= 3)
-      gl_traj = PolynomialTraj::minSnapTraj(pos, start_vel, end_vel, start_acc, end_acc, time);
-    else if (pos.cols() == 2)
-      gl_traj = PolynomialTraj::one_segment_traj_gen(start_pos, start_vel, start_acc, end_pos, end_vel, end_acc, time(0));
-    else
+    const char* timing_reason = nullptr;
+    if (!makePlannerGuidanceReference(points, start_vel, start_acc, end_vel, end_acc,
+                            pp_.max_vel_, pp_.max_acc_, pp_.ctrl_pt_dist,
+                            pp_.max_vel_+pp_.vel_tolerance_, pp_.max_acc_+pp_.acc_tolerance_,
+                            gl_traj, timing_reason))
+    {
+      RCLCPP_WARN(node_->get_logger(),
+          "SCAN_REFERENCE_REJECT reason=%s start_v=%.6f start_a=%.6f end_v=%.6f end_a=%.6f nominal_v=%.6f nominal_a=%.6f allowed_v=%.6f allowed_a=%.6f points=%zu",
+          timing_reason, start_vel.norm(), start_acc.norm(), end_vel.norm(), end_acc.norm(),
+          pp_.max_vel_, pp_.max_acc_, pp_.max_vel_+pp_.vel_tolerance_, pp_.max_acc_+pp_.acc_tolerance_, points.size());
       return false;
+    }
+    if (std::string(timing_reason) != "ORIGINAL_BOUNDARY") {
+      RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+          "SCAN_REFERENCE_GUIDE reason=%s start_v=%.6f start_a=%.6f; executable boundary unchanged",
+          timing_reason, start_vel.norm(), start_acc.norm());
+    }
 
     auto time_now = node_->now();
     global_data_.setGlobalTraj(gl_traj, time_now);
@@ -576,41 +492,38 @@ namespace scan_planner
     local_data_.traj_id_ += 1;
   }
 
-  bool SCANPlannerManager::checkDynamicFeasibility(
-    UniformBspline position_traj, double *required_time_scale, const bool log_failure)
+  bool SCANPlannerManager::checkDynamicFeasibility(UniformBspline position_traj)
   {
     UniformBspline vel_traj = position_traj.getDerivative();
     UniformBspline acc_traj = vel_traj.getDerivative();
     const double duration = position_traj.getTimeSum();
     const double sample_dt = std::max(0.01, std::min(0.05, duration / 50.0));
-    const double tolerance_scale = 1.0 + std::max(0.0, pp_.feasibility_tolerance_);
-    const double vel_limit = pp_.max_vel_ * tolerance_scale + 1e-4;
-    const double acc_limit = pp_.max_acc_ * tolerance_scale + 1e-4;
-    double max_velocity = 0.0;
-    double max_acceleration = 0.0;
+    const double vel_limit = pp_.max_vel_ + pp_.vel_tolerance_;
+    const double acc_limit = pp_.max_acc_ + pp_.acc_tolerance_;
 
     for (double t = 0.0; t < duration + 1e-6; t += sample_dt)
     {
       const double tc = std::min(t, duration);
-      max_velocity = std::max(max_velocity, vel_traj.evaluateDeBoorT(tc).norm());
-      max_acceleration = std::max(max_acceleration, acc_traj.evaluateDeBoorT(tc).norm());
+      Eigen::Vector3d vel = vel_traj.evaluateDeBoorT(tc);
+      if (vel.norm() > vel_limit)
+      {
+        RCLCPP_WARN(node_->get_logger(),
+                    "Dynamic feasibility failed: velocity at t=%.3f is %.3f > %.3f",
+                    tc, vel.norm(), vel_limit);
+        return false;
+      }
+
+      Eigen::Vector3d acc = acc_traj.evaluateDeBoorT(tc);
+      if (acc.norm() > acc_limit)
+      {
+        RCLCPP_WARN(node_->get_logger(),
+                    "Dynamic feasibility failed: acceleration at t=%.3f is %.3f > %.3f",
+                    tc, acc.norm(), acc_limit);
+        return false;
+      }
     }
 
-    const double scale = requiredTimeScale(
-      max_velocity, max_acceleration, vel_limit, acc_limit);
-    if (required_time_scale != nullptr)
-      *required_time_scale = scale;
-    if (scale <= 1.0)
-      return true;
-
-    if (log_failure)
-    {
-      RCLCPP_WARN(
-        node_->get_logger(),
-        "Dynamic feasibility failed after retiming: velocity %.3f/%.3f, acceleration %.3f/%.3f, required scale %.3f",
-        max_velocity, vel_limit, max_acceleration, acc_limit, scale);
-    }
-    return false;
+    return true;
   }
 
   void SCANPlannerManager::reparamBspline(UniformBspline &bspline, vector<Eigen::Vector3d> &start_end_derivative, double ratio,
